@@ -418,6 +418,10 @@ type RecordMode int
 const (
 	RecordReplayOnly RecordMode = iota
 	RecordAlways
+	// RecordOnMiss replays certified calls when present and invokes the real
+	// provider only for absent recordings. It exists for explicit cassette
+	// healing; CI remains fail-closed on RecordReplayOnly.
+	RecordOnMiss
 )
 
 type StreamEventType string

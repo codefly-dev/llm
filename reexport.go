@@ -87,6 +87,7 @@ type RecordMode = contract.RecordMode
 const (
 	RecordReplayOnly = contract.RecordReplayOnly
 	RecordAlways     = contract.RecordAlways
+	RecordOnMiss     = contract.RecordOnMiss
 
 	PriceLevelStandard = contract.PriceLevelStandard
 	PriceLevelBatch    = contract.PriceLevelBatch

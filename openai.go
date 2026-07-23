@@ -12,8 +12,10 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/benbjohnson/clock"
 	openai "github.com/openai/openai-go"
@@ -28,6 +30,12 @@ type OpenAI struct {
 	model string
 	clock clock.Clock
 
+	// timeouts applies the same provider-attempt discipline used by
+	// Anthropic. The OpenAI SDK has no end-to-end request deadline of its
+	// own, so every live completion and Responses API turn must carry a
+	// bounded child context. Zero values select the package defaults.
+	timeouts TimeoutConfig
+
 	lastUsage atomic.Pointer[Usage]
 }
 
@@ -36,6 +44,10 @@ func NewOpenAI(apiKey, model string) *OpenAI {
 	sdk := openai.NewClient(option.WithAPIKey(apiKey))
 	return &OpenAI{sdk: sdk, model: model, clock: clock.New()}
 }
+
+// SetTimeouts implements TimeoutConfigurable. Call it during client
+// construction, before the provider is shared across sessions.
+func (c *OpenAI) SetTimeouts(cfg TimeoutConfig) { c.timeouts = cfg }
 
 func (c *OpenAI) SetRuntimeClock(runtimeClock clock.Clock) {
 	if runtimeClock != nil {
@@ -173,13 +185,31 @@ func (c *OpenAI) runStream(
 	params openai.ChatCompletionNewParams,
 	onChunk func(text string) error,
 ) (string, error) {
-	stream := c.sdk.Chat.Completions.NewStreaming(ctx, params)
+	timeouts := c.timeouts.withDefaults()
+	warnNearDeadline(ctx, "openai", c.model, timeouts, c.clock)
+
+	attemptCtx, cancelAttempt := timeouts.attemptContext(ctx)
+	defer cancelAttempt()
+
+	streamCtx, cancelStream := context.WithCancelCause(attemptCtx)
+	defer cancelStream(nil)
+	var watchdog *time.Timer
+	if timeouts.StreamStall > 0 {
+		stall := timeouts.StreamStall
+		watchdog = time.AfterFunc(stall, func() { cancelStream(stallError("openai", stall)) })
+		defer watchdog.Stop()
+	}
+
+	stream := c.sdk.Chat.Completions.NewStreaming(streamCtx, params)
 	defer func() { _ = stream.Close() }()
 
 	var full []byte
 	var lastUsage openai.CompletionUsage
 
 	for stream.Next() {
+		if watchdog != nil {
+			watchdog.Reset(timeouts.StreamStall)
+		}
 		chunk := stream.Current()
 		if chunk.Usage.TotalTokens > 0 {
 			lastUsage = chunk.Usage
@@ -199,7 +229,19 @@ func (c *OpenAI) runStream(
 		}
 	}
 	if err := stream.Err(); err != nil {
+		if cause := context.Cause(streamCtx); cause != nil && errors.Is(cause, ErrStreamStalled) {
+			return string(full), cause
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return string(full), c.classify(fmt.Errorf("%w (stream aborted: %v)", ctxErr, err))
+		}
+		if attemptCtx.Err() != nil {
+			return string(full), c.classify(fmt.Errorf("openai: per-attempt timeout %s exceeded: %w (stream error: %v)", timeouts.PerAttempt, context.DeadlineExceeded, err))
+		}
 		return string(full), c.classify(err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return string(full), c.classify(ctxErr)
 	}
 
 	c.storeUsage(lastUsage)
@@ -223,11 +265,12 @@ func (c *OpenAI) storeUsage(u openai.CompletionUsage) {
 
 // Compile-time contract assertions.
 var (
-	_ Client             = (*OpenAI)(nil)
-	_ OptionedClient     = (*OpenAI)(nil)
-	_ ToolClient         = (*OpenAI)(nil)
-	_ OptionedToolClient = (*OpenAI)(nil)
-	_ EventStreamClient  = (*OpenAI)(nil)
-	_ UsageProvider      = (*OpenAI)(nil)
-	_ ProviderMeta       = (*OpenAI)(nil)
+	_ Client              = (*OpenAI)(nil)
+	_ OptionedClient      = (*OpenAI)(nil)
+	_ ToolClient          = (*OpenAI)(nil)
+	_ OptionedToolClient  = (*OpenAI)(nil)
+	_ EventStreamClient   = (*OpenAI)(nil)
+	_ UsageProvider       = (*OpenAI)(nil)
+	_ ProviderMeta        = (*OpenAI)(nil)
+	_ TimeoutConfigurable = (*OpenAI)(nil)
 )
