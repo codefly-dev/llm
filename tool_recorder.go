@@ -25,6 +25,8 @@ package llm
 //   RecordAlways    — skip replay, always call real, overwrite on disk.
 //                      Use when the tool's underlying graph has changed
 //                      and every recording should be refreshed.
+//   RecordOnMiss    — replay exact hits and call the real tool only when
+//                     its recording is absent. Corrupt recordings fail.
 //
 // ── What NOT to wrap with this ────────────────────────────────────────
 //
@@ -40,6 +42,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,10 +86,13 @@ func (r *ToolRecorder) Call(ctx context.Context, name string, args map[string]an
 	path := filepath.Join(r.dir, "tool_"+hash+".json")
 
 	if r.mode != RecordAlways {
-		if content, err := r.replay(path); err == nil {
+		content, replayErr := r.replay(path)
+		if replayErr == nil {
 			return content, nil
 		}
-		return "", fmt.Errorf("tool recorder: no recording for %s (hash=%s) in %s — set MIND_RECORD=1 to record", name, hash, r.dir)
+		if r.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
+			return "", fmt.Errorf("tool recorder: no recording for %s (hash=%s) in %s: %w — set MIND_RECORD=heal to fill gaps or MIND_RECORD=1 to re-record", name, hash, r.dir, replayErr)
+		}
 	}
 
 	content, err := r.inner.Call(ctx, name, args)

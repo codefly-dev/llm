@@ -187,6 +187,57 @@ func TestRecorder_ToolClientReplayOnlyMissing(t *testing.T) {
 	}
 }
 
+func TestRecorder_OnMissReplaysHitsAndRecordsMisses(t *testing.T) {
+	dir := t.TempDir()
+	recordInner := &recorderInfraClient{response: Message{Content: "recorded"}}
+	record := RecorderMiddleware(dir, "test-model", RecordAlways)(recordInner)
+	if _, err := record.Call(t.Context(), "existing"); err != nil {
+		t.Fatal(err)
+	}
+
+	healInner := &recorderInfraClient{response: Message{Content: "healed"}}
+	heal := RecorderMiddleware(dir, "test-model", RecordOnMiss)(healInner)
+	existing, err := heal.Call(t.Context(), "existing")
+	if err != nil {
+		t.Fatalf("replay existing recording: %v", err)
+	}
+	if existing != "recorded" || healInner.calls != 0 {
+		t.Fatalf("existing response=%q live calls=%d, want recorded/0", existing, healInner.calls)
+	}
+	missing, err := heal.Call(t.Context(), "missing")
+	if err != nil {
+		t.Fatalf("record exact miss: %v", err)
+	}
+	if missing != "healed" || healInner.calls != 1 {
+		t.Fatalf("missing response=%q live calls=%d, want healed/1", missing, healInner.calls)
+	}
+
+	replayInner := &recorderInfraClient{response: Message{Content: "must not run"}}
+	replayed, err := RecorderMiddleware(dir, "test-model", RecordReplayOnly)(replayInner).Call(t.Context(), "missing")
+	if err != nil {
+		t.Fatalf("replay healed recording: %v", err)
+	}
+	if replayed != "healed" || replayInner.calls != 0 {
+		t.Fatalf("replayed response=%q live calls=%d, want healed/0", replayed, replayInner.calls)
+	}
+}
+
+func TestRecorder_OnMissRejectsCorruptExistingRecording(t *testing.T) {
+	dir := t.TempDir()
+	prompt := "corrupt"
+	path := filepath.Join(dir, hashKey("test-model", prompt)+".json")
+	if err := os.WriteFile(path, []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inner := &recorderInfraClient{response: Message{Content: "must not run"}}
+	if _, err := RecorderMiddleware(dir, "test-model", RecordOnMiss)(inner).Call(t.Context(), prompt); err == nil {
+		t.Fatal("heal accepted a corrupt existing recording")
+	}
+	if inner.calls != 0 {
+		t.Fatalf("live calls=%d, want 0 for corrupt recording", inner.calls)
+	}
+}
+
 func TestRecorderReplayDoesNotCrossModelFamilies(t *testing.T) {
 	dir := t.TempDir()
 	prompt := "same task and prompt"
@@ -648,5 +699,8 @@ func TestRecordMode_Constants(t *testing.T) {
 	}
 	if RecordAlways != 1 {
 		t.Error("RecordAlways should be 1")
+	}
+	if RecordOnMiss != 2 {
+		t.Error("RecordOnMiss should be 2")
 	}
 }

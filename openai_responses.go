@@ -20,8 +20,16 @@ func (c *OpenAI) callResponsesWithTools(ctx context.Context, system string, mess
 	if err != nil {
 		return Message{}, fmt.Errorf("openai responses request: %w", err)
 	}
-	resp, err := c.sdk.Responses.New(ctx, params)
+	timeouts := c.timeouts.withDefaults()
+	warnNearDeadline(ctx, "openai", c.model, timeouts, c.clock)
+	attemptCtx, cancelAttempt := timeouts.attemptContext(ctx)
+	defer cancelAttempt()
+
+	resp, err := c.sdk.Responses.New(attemptCtx, params)
 	if err != nil {
+		if ctx.Err() == nil && attemptCtx.Err() != nil {
+			return Message{}, c.classify(fmt.Errorf("openai: per-attempt timeout %s exceeded: %w (request error: %v)", timeouts.PerAttempt, context.DeadlineExceeded, err))
+		}
 		return Message{}, c.classify(err)
 	}
 	c.storeResponseUsage(resp.Usage)
@@ -149,7 +157,6 @@ func reasoningInputItem(block ReasoningBlock) (responses.ResponseInputItemUnionP
 	item := responses.ResponseReasoningItemParam{
 		ID:      block.Data,
 		Summary: []responses.ResponseReasoningItemSummaryParam{},
-		Status:  responses.ResponseReasoningItemStatusCompleted,
 	}
 	if block.Text != "" {
 		item.Summary = append(item.Summary, responses.ResponseReasoningItemSummaryParam{Text: block.Text})

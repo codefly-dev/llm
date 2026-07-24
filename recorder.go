@@ -76,7 +76,7 @@ func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
 	if strings.TrimSpace(cfg.Model) == "" {
 		configErr = errors.Join(configErr, fmt.Errorf("recorder model is empty"))
 	}
-	if cfg.Mode != RecordReplayOnly && cfg.Mode != RecordAlways {
+	if cfg.Mode != RecordReplayOnly && cfg.Mode != RecordAlways && cfg.Mode != RecordOnMiss {
 		configErr = errors.Join(configErr, fmt.Errorf("invalid recorder mode %d", cfg.Mode))
 	}
 	return func(next Client) Client {
@@ -136,12 +136,14 @@ func (m *recorderMW) CallWithOptions(ctx context.Context, prompt string, opts Re
 	// Try replay.
 	if m.mode != RecordAlways {
 		resp, replayErr := m.replay(path, hash, recordingText)
-		if replayErr != nil {
+		if replayErr == nil {
+			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			m.dumpDebugKey("replay", hash, keyInput)
+			return resp.Response, recordedError(resp)
+		}
+		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return "", fmt.Errorf("recorder: replay call %s: %w", hash, replayErr)
 		}
-		span.SetAttributes(attribute.String("llm.recorder", "replay"))
-		m.dumpDebugKey("replay", hash, keyInput)
-		return resp.Response, recordedError(resp)
 	}
 
 	// Call the real provider.
@@ -174,17 +176,19 @@ func (m *recorderMW) StreamWithOptions(ctx context.Context, prompt string, opts 
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingText)
-		if replayErr != nil {
+		if replayErr == nil {
+			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			m.dumpDebugKey("replay", hash, keyInput)
+			if onChunk != nil && rec.Response != "" {
+				if callbackErr := onChunk(rec.Response); callbackErr != nil {
+					return rec.Response, callbackErr
+				}
+			}
+			return rec.Response, recordedError(rec)
+		}
+		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return "", fmt.Errorf("recorder: replay stream %s: %w", hash, replayErr)
 		}
-		span.SetAttributes(attribute.String("llm.recorder", "replay"))
-		m.dumpDebugKey("replay", hash, keyInput)
-		if onChunk != nil && rec.Response != "" {
-			if callbackErr := onChunk(rec.Response); callbackErr != nil {
-				return rec.Response, callbackErr
-			}
-		}
-		return rec.Response, recordedError(rec)
 	}
 
 	if err := m.claim(path); err != nil {
@@ -228,11 +232,13 @@ func (m *recorderMW) CallCachedWithOptions(ctx context.Context, system, user str
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingText)
-		if replayErr != nil {
+		if replayErr == nil {
+			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			return rec.Response, recordedError(rec)
+		}
+		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return "", fmt.Errorf("recorder: replay cached call %s: %w", hash, replayErr)
 		}
-		span.SetAttributes(attribute.String("llm.recorder", "replay"))
-		return rec.Response, recordedError(rec)
 	}
 
 	if err := m.claim(path); err != nil {
@@ -270,17 +276,19 @@ func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, me
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingTool)
-		if replayErr != nil {
+		if replayErr == nil {
+			var msg Message
+			if err := json.Unmarshal(rec.ToolResponse, &msg); err != nil {
+				return Message{}, fmt.Errorf("recorder: decode tool response %s: %w", hash, err)
+			}
+			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			m.dumpDebugKey("replay", hash, keyInput)
+			return msg, recordedError(rec)
+		}
+		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			m.dumpDebugKey("miss", hash, keyInput)
 			return Message{}, fmt.Errorf("recorder: replay tool call %s: %w", hash, replayErr)
 		}
-		var msg Message
-		if err := json.Unmarshal(rec.ToolResponse, &msg); err != nil {
-			return Message{}, fmt.Errorf("recorder: decode tool response %s: %w", hash, err)
-		}
-		span.SetAttributes(attribute.String("llm.recorder", "replay"))
-		m.dumpDebugKey("replay", hash, keyInput)
-		return msg, recordedError(rec)
 	}
 
 	if err := m.claim(path); err != nil {
@@ -328,20 +336,22 @@ func (m *recorderMW) StreamEvents(ctx context.Context, req StreamRequest) (<-cha
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingEvents)
-		if replayErr != nil {
+		if replayErr == nil {
+			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			out := make(chan StreamEvent, len(rec.Events))
+			go func() {
+				defer close(out)
+				for _, event := range rec.Events {
+					if err := sendRecorderEvent(ctx, out, event); err != nil {
+						return
+					}
+				}
+			}()
+			return out, nil
+		}
+		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return nil, fmt.Errorf("recorder: replay event stream %s: %w", hash, replayErr)
 		}
-		span.SetAttributes(attribute.String("llm.recorder", "replay"))
-		out := make(chan StreamEvent, len(rec.Events))
-		go func() {
-			defer close(out)
-			for _, event := range rec.Events {
-				if err := sendRecorderEvent(ctx, out, event); err != nil {
-					return
-				}
-			}
-		}()
-		return out, nil
 	}
 
 	if err := m.claim(path); err != nil {

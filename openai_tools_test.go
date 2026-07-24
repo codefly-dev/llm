@@ -162,6 +162,9 @@ func TestOpenAIResponseParamsUsesResponsesToolProtocol(t *testing.T) {
 			t.Fatalf("Responses request missing %s: %s", want, text)
 		}
 	}
+	if strings.Contains(text, `"status"`) {
+		t.Fatalf("Responses input leaked output-only reasoning status: %s", text)
+	}
 	if strings.Contains(text, `"reasoning_effort"`) {
 		t.Fatalf("Chat Completions reasoning_effort leaked into Responses request: %s", text)
 	}
