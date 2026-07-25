@@ -12,10 +12,8 @@ package llm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync/atomic"
-	"time"
 
 	"github.com/benbjohnson/clock"
 	openai "github.com/openai/openai-go"
@@ -185,31 +183,17 @@ func (c *OpenAI) runStream(
 	params openai.ChatCompletionNewParams,
 	onChunk func(text string) error,
 ) (string, error) {
-	timeouts := c.timeouts.withDefaults()
-	warnNearDeadline(ctx, "openai", c.model, timeouts, c.clock)
+	guard := newStreamGuard(ctx, c.timeouts, "openai", c.model, c.clock)
+	defer guard.close()
 
-	attemptCtx, cancelAttempt := timeouts.attemptContext(ctx)
-	defer cancelAttempt()
-
-	streamCtx, cancelStream := context.WithCancelCause(attemptCtx)
-	defer cancelStream(nil)
-	var watchdog *time.Timer
-	if timeouts.StreamStall > 0 {
-		stall := timeouts.StreamStall
-		watchdog = time.AfterFunc(stall, func() { cancelStream(stallError("openai", stall)) })
-		defer watchdog.Stop()
-	}
-
-	stream := c.sdk.Chat.Completions.NewStreaming(streamCtx, params)
+	stream := c.sdk.Chat.Completions.NewStreaming(guard.ctx(), params)
 	defer func() { _ = stream.Close() }()
 
 	var full []byte
 	var lastUsage openai.CompletionUsage
 
 	for stream.Next() {
-		if watchdog != nil {
-			watchdog.Reset(timeouts.StreamStall)
-		}
+		guard.reset()
 		chunk := stream.Current()
 		if chunk.Usage.TotalTokens > 0 {
 			lastUsage = chunk.Usage
@@ -229,19 +213,10 @@ func (c *OpenAI) runStream(
 		}
 	}
 	if err := stream.Err(); err != nil {
-		if cause := context.Cause(streamCtx); cause != nil && errors.Is(cause, ErrStreamStalled) {
-			return string(full), cause
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return string(full), c.classify(fmt.Errorf("%w (stream aborted: %v)", ctxErr, err))
-		}
-		if attemptCtx.Err() != nil {
-			return string(full), c.classify(fmt.Errorf("openai: per-attempt timeout %s exceeded: %w (stream error: %v)", timeouts.PerAttempt, context.DeadlineExceeded, err))
-		}
-		return string(full), c.classify(err)
+		return string(full), guard.attribute(err, c.classify)
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return string(full), c.classify(ctxErr)
+	if ctxErr := guard.callerExpired(c.classify); ctxErr != nil {
+		return string(full), ctxErr
 	}
 
 	c.storeUsage(lastUsage)

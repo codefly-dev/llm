@@ -114,6 +114,106 @@ type RuntimeClockConfigurable interface {
 	SetRuntimeClock(clock.Clock)
 }
 
+// streamGuard bounds ONE streaming attempt with the two brakes from this
+// file: the per-attempt budget (a child context of the caller's ctx) and the
+// inter-event stall watchdog. It exists so every streaming provider shares one
+// implementation of the retryability-critical error attribution below instead
+// of hand-syncing a copy per provider.
+//
+// Lifecycle: build with newStreamGuard, hand ctx() to the SDK's streaming
+// constructor, call reset() after every received event to re-arm the watchdog,
+// and defer close(). Route the terminal stream error through attribute(), and
+// guard clean completion with callerExpired().
+type streamGuard struct {
+	caller        context.Context
+	attemptCtx    context.Context
+	streamCtx     context.Context
+	provider      string
+	perAttempt    time.Duration
+	stall         time.Duration
+	watchdog      *time.Timer
+	cancelAttempt context.CancelFunc
+	cancelStream  context.CancelCauseFunc
+}
+
+// newStreamGuard normalizes cfg, emits the near-deadline observability warning,
+// and derives the per-attempt + stall-watchdog contexts. The caller MUST defer
+// close() to release both contexts and stop the watchdog.
+func newStreamGuard(ctx context.Context, cfg TimeoutConfig, provider, model string, runtimeClock clock.Clock) *streamGuard {
+	cfg = cfg.withDefaults()
+	warnNearDeadline(ctx, provider, model, cfg, runtimeClock)
+
+	attemptCtx, cancelAttempt := cfg.attemptContext(ctx)
+	streamCtx, cancelStream := context.WithCancelCause(attemptCtx)
+	g := &streamGuard{
+		caller:        ctx,
+		attemptCtx:    attemptCtx,
+		streamCtx:     streamCtx,
+		provider:      provider,
+		perAttempt:    cfg.PerAttempt,
+		stall:         cfg.StreamStall,
+		cancelAttempt: cancelAttempt,
+		cancelStream:  cancelStream,
+	}
+	if cfg.StreamStall > 0 {
+		stall := cfg.StreamStall
+		g.watchdog = time.AfterFunc(stall, func() { cancelStream(stallError(provider, stall)) })
+	}
+	return g
+}
+
+// ctx is the context to hand to the SDK's streaming constructor.
+func (g *streamGuard) ctx() context.Context { return g.streamCtx }
+
+// reset re-arms the stall watchdog; call it once per received stream event.
+// No-op when the watchdog is disabled.
+func (g *streamGuard) reset() {
+	if g.watchdog != nil {
+		g.watchdog.Reset(g.stall)
+	}
+}
+
+// close stops the watchdog and releases the derived contexts. Deferring it
+// preserves the original stop→cancelStream→cancelAttempt ordering.
+func (g *streamGuard) close() {
+	if g.watchdog != nil {
+		g.watchdog.Stop()
+	}
+	g.cancelStream(nil)
+	g.cancelAttempt()
+}
+
+// attribute maps a failed streaming attempt's terminal error to the error to
+// surface, in priority order: watchdog stall (typed, retryable, returned as-is
+// so the ProviderError survives) → dead CALLER ctx (its deadline/cancel must
+// surface, not an opaque transport error) → our per-attempt budget (retryable
+// timeout, DeadlineExceeded wrapped explicitly because the transport error is
+// not guaranteed to carry it) → the raw transport error. classify is the
+// provider's own classifier.
+func (g *streamGuard) attribute(streamErr error, classify func(error) error) error {
+	if cause := context.Cause(g.streamCtx); cause != nil && errors.Is(cause, ErrStreamStalled) {
+		return cause
+	}
+	if ctxErr := g.caller.Err(); ctxErr != nil {
+		return classify(fmt.Errorf("%w (stream aborted: %v)", ctxErr, streamErr))
+	}
+	if g.attemptCtx.Err() != nil {
+		return classify(fmt.Errorf("%s: per-attempt timeout %s exceeded: %w (stream error: %v)", g.provider, g.perAttempt, context.DeadlineExceeded, streamErr))
+	}
+	return classify(streamErr)
+}
+
+// callerExpired returns classify(ctx.Err()) when the caller ctx is already dead
+// even though the stream ended without error, else nil. A stream must never
+// report clean success on a dead caller ctx — callers rely on the error to stop
+// looping.
+func (g *streamGuard) callerExpired(classify func(error) error) error {
+	if ctxErr := g.caller.Err(); ctxErr != nil {
+		return classify(ctxErr)
+	}
+	return nil
+}
+
 // stallError builds the typed, retryable error the watchdog aborts with.
 // ProviderError with CodeTimeout → IsRetryable(err) is true; the Wrapped
 // chain carries ErrStreamStalled for precise matching.
