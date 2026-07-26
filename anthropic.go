@@ -13,10 +13,8 @@ package llm
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync/atomic"
-	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -305,37 +303,21 @@ func (c *Anthropic) runStream(
 	params anthropic.MessageNewParams,
 	onChunk func(text string) error,
 ) (string, error) {
-	timeouts := c.timeouts.withDefaults()
-	warnNearDeadline(ctx, "anthropic", c.model, timeouts, c.clock)
+	// Per-attempt budget + inter-event stall watchdog (timeouts.go). The
+	// watchdog observes MODEL events only — the SDK swallows keepalive `ping`
+	// events inside stream.Next() — so its window must stay well above the
+	// provider's normal inter-delta gap.
+	guard := newStreamGuard(ctx, c.timeouts, "anthropic", c.model, c.clock)
+	defer guard.close()
 
-	// Attempt budget: hard ceiling on the whole stream.
-	attemptCtx, cancelAttempt := timeouts.attemptContext(ctx)
-	defer cancelAttempt()
-
-	// Stall watchdog: aborts the stream (with a typed retryable cause) when
-	// no event arrives within the window; every received event re-arms it.
-	// NOTE: the SDK swallows keepalive `ping` events inside stream.Next(), so
-	// the watchdog observes MODEL events only — the window must stay well
-	// above the provider's normal inter-delta gap (see timeouts.go).
-	streamCtx, cancelStream := context.WithCancelCause(attemptCtx)
-	defer cancelStream(nil)
-	var watchdog *time.Timer
-	if timeouts.StreamStall > 0 {
-		stall := timeouts.StreamStall
-		watchdog = time.AfterFunc(stall, func() { cancelStream(stallError("anthropic", stall)) })
-		defer watchdog.Stop()
-	}
-
-	stream := c.sdk.Messages.NewStreaming(streamCtx, params)
+	stream := c.sdk.Messages.NewStreaming(guard.ctx(), params)
 	defer func() { _ = stream.Close() }()
 
 	var acc anthropic.Message
 	var full []byte
 
 	for stream.Next() {
-		if watchdog != nil {
-			watchdog.Reset(timeouts.StreamStall)
-		}
+		guard.reset()
 		event := stream.Current()
 		if err := acc.Accumulate(event); err != nil {
 			return string(full), fmt.Errorf("anthropic: accumulate: %w", err)
@@ -353,30 +335,14 @@ func (c *Anthropic) runStream(
 		}
 	}
 	if err := stream.Err(); err != nil {
-		// Attribute the abort precisely, in priority order: watchdog stall
-		// (typed, retryable), dead CALLER ctx (the caller's deadline/cancel
-		// must surface as the cause, not as an opaque transport error), then
-		// our per-attempt budget (retryable timeout), then the raw error.
-		if cause := context.Cause(streamCtx); cause != nil && errors.Is(cause, ErrStreamStalled) {
-			return string(full), cause
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return string(full), c.classify(fmt.Errorf("%w (stream aborted: %v)", ctxErr, err))
-		}
-		if attemptCtx.Err() != nil {
-			// Wrap DeadlineExceeded explicitly: the transport's body-read
-			// error is not guaranteed to carry the ctx error, and the
-			// classifier keys retryability off it (CodeTimeout).
-			return string(full), c.classify(fmt.Errorf("anthropic: per-attempt timeout %s exceeded: %w (stream error: %v)", timeouts.PerAttempt, context.DeadlineExceeded, err))
-		}
-		return string(full), c.classify(err)
+		return string(full), guard.attribute(err, c.classify)
 	}
 	// Defensive ctx discipline: a stream must never report clean success when
 	// the caller's ctx is already dead (e.g. the server closed the stream in
 	// the same instant the deadline fired) — callers rely on the error to
 	// stop looping.
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return string(full), c.classify(ctxErr)
+	if ctxErr := guard.callerExpired(c.classify); ctxErr != nil {
+		return string(full), ctxErr
 	}
 
 	c.storeUsage(acc.Usage)
