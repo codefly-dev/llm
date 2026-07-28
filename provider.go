@@ -280,11 +280,12 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	// budget, record usage, wait on rate limits, trip the circuit, or retry.
 	if b.recorder {
 		mws = append(mws, RecorderMiddlewareWithConfig(RecorderConfig{
-			Dir:   b.recorderDir,
-			Model: fullModelName,
-			Mode:  b.recordMode,
-			RunID: b.recorderRunID,
-			Clock: b.recorderClock,
+			Dir:               b.recorderDir,
+			Model:             fullModelName,
+			TransportIdentity: transportIdentity,
+			Mode:              b.recordMode,
+			RunID:             b.recorderRunID,
+			Clock:             b.recorderClock,
 		}))
 	}
 

@@ -107,6 +107,7 @@ type recorderInfraClient struct {
 	response Message
 	err      error
 	calls    int
+	usage    *Usage
 }
 
 func (s *recorderInfraClient) Call(_ context.Context, _ string) (string, error) {
@@ -127,6 +128,93 @@ func (s *recorderInfraClient) Stream(_ context.Context, _ string, onChunk func(s
 func (s *recorderInfraClient) CallWithTools(_ context.Context, _ string, _ []Message, _ []ToolDef) (Message, error) {
 	s.calls++
 	return s.response, s.err
+}
+
+func (s *recorderInfraClient) LastCallUsage() *Usage {
+	if s.usage == nil {
+		return nil
+	}
+	usage := *s.usage
+	return &usage
+}
+
+func TestRecorderPersistsRequestUsageAndTransportIdentity(t *testing.T) {
+	dir := t.TempDir()
+	prompt := "qualification prompt"
+	usage := &Usage{
+		Provider: "anthropic", Model: "claude-haiku-4-5",
+		InputTokens: 11, OutputTokens: 4, CachedTokens: 3,
+	}
+	record := RecorderMiddlewareWithConfig(RecorderConfig{
+		Dir: dir, Model: "anthropic/claude-haiku-4-5",
+		TransportIdentity: TransportIdentityGateway,
+		Mode:              RecordAlways,
+	})(&recorderInfraClient{response: Message{Content: `{"qualified":true}`}, usage: usage})
+	if _, err := record.Call(t.Context(), prompt); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, hashKey("anthropic/claude-haiku-4-5", prompt)+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted recording
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	var typedResponse struct {
+		Qualified bool `json:"qualified"`
+	}
+	if err := json.Unmarshal(persisted.TypedResponse, &typedResponse); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Request != prompt ||
+		persisted.TransportIdentity != TransportIdentityGateway ||
+		!typedResponse.Qualified ||
+		persisted.Usage == nil ||
+		persisted.Usage.InputTokens != usage.InputTokens ||
+		persisted.Usage.OutputTokens != usage.OutputTokens ||
+		persisted.Usage.CachedTokens != usage.CachedTokens {
+		t.Fatalf("persisted recording = %#v", persisted)
+	}
+
+	replay := RecorderMiddlewareWithConfig(RecorderConfig{
+		Dir: dir, Model: "anthropic/claude-haiku-4-5",
+		TransportIdentity: TransportIdentityGateway,
+		Mode:              RecordReplayOnly,
+	})(&recorderInfraClient{})
+	if response, err := replay.Call(t.Context(), prompt); err != nil || response != `{"qualified":true}` {
+		t.Fatalf("replay = %q, %v", response, err)
+	}
+	replayedUsage := replay.(UsageProvider).LastCallUsage()
+	if replayedUsage == nil ||
+		replayedUsage.InputTokens != usage.InputTokens ||
+		replayedUsage.OutputTokens != usage.OutputTokens ||
+		replayedUsage.CachedTokens != usage.CachedTokens {
+		t.Fatalf("replayed usage = %#v", replayedUsage)
+	}
+
+	plainPrompt := "plain qualification prompt"
+	plain := RecorderMiddlewareWithConfig(RecorderConfig{
+		Dir: dir, Model: "anthropic/claude-haiku-4-5",
+		TransportIdentity: TransportIdentityGateway,
+		Mode:              RecordAlways,
+	})(&recorderInfraClient{response: Message{Content: "qualified"}, usage: usage})
+	if _, err := plain.Call(t.Context(), plainPrompt); err != nil {
+		t.Fatal(err)
+	}
+	plainRaw, err := os.ReadFile(filepath.Join(dir, hashKey("anthropic/claude-haiku-4-5", plainPrompt)+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plainPersisted recording
+	if err := json.Unmarshal(plainRaw, &plainPersisted); err != nil {
+		t.Fatal(err)
+	}
+	var plainTyped string
+	if err := json.Unmarshal(plainPersisted.TypedResponse, &plainTyped); err != nil || plainTyped != "qualified" {
+		t.Fatalf("plain typed response = %q, %v", plainTyped, err)
+	}
 }
 
 func TestRecorder_ToolClientRecordReplay(t *testing.T) {
