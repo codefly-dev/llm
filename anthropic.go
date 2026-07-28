@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync/atomic"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
@@ -39,6 +40,8 @@ type Anthropic struct {
 
 	// lastUsage is stored atomically — multiple sessions share one Anthropic instance.
 	lastUsage atomic.Pointer[Usage]
+
+	transportIdentity TransportIdentity
 }
 
 // NewAnthropic returns an Anthropic client for the given API key and model id,
@@ -53,7 +56,36 @@ func NewAnthropic(apiKey, model string) *Anthropic {
 // fields disable that brake (see TimeoutConfig).
 func NewAnthropicWithTimeouts(apiKey, model string, timeouts TimeoutConfig) *Anthropic {
 	sdk := anthropic.NewClient(option.WithAPIKey(apiKey))
-	return &Anthropic{sdk: sdk, model: model, clock: clock.New(), timeouts: timeouts}
+	return &Anthropic{
+		sdk:               sdk,
+		model:             model,
+		clock:             clock.New(),
+		timeouts:          timeouts,
+		transportIdentity: TransportIdentityDirectProvider,
+	}
+}
+
+func newAnthropicWithTransport(model string, transport providerTransport) *Anthropic {
+	options := []option.RequestOption{
+		option.WithoutEnvironmentDefaults(),
+		option.WithBaseURL(transport.baseURL),
+	}
+	headerNames := make([]string, 0, len(transport.staticHeaders))
+	for name := range transport.staticHeaders {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	for _, name := range headerNames {
+		options = append(options, option.WithHeader(name, transport.staticHeaders[name]))
+	}
+	options = append(options, option.WithHeader(transport.authHeader, transport.credential))
+	sdk := anthropic.NewClient(options...)
+	return &Anthropic{
+		sdk:               sdk,
+		model:             model,
+		clock:             clock.New(),
+		transportIdentity: transport.identity,
+	}
 }
 
 // SetTimeouts implements TimeoutConfigurable so NewClient's WithTimeouts
@@ -73,6 +105,12 @@ func (c *Anthropic) classify(err error) error {
 
 func (c *Anthropic) Provider() string { return "anthropic" }
 func (c *Anthropic) Model() string    { return c.model }
+func (c *Anthropic) TransportIdentity() TransportIdentity {
+	if c.transportIdentity == "" {
+		return TransportIdentityDirectProvider
+	}
+	return c.transportIdentity
+}
 
 // LastCallUsage returns the token counts from the most recent API call.
 // Returns nil before any call. Values include cache-read tokens where the
@@ -575,6 +613,7 @@ var (
 	_ EventStreamClient       = (*Anthropic)(nil)
 	_ UsageProvider           = (*Anthropic)(nil)
 	_ ProviderMeta            = (*Anthropic)(nil)
+	_ TransportMeta           = (*Anthropic)(nil)
 	_ HostedWebSearcher       = (*Anthropic)(nil)
 	_ TimeoutConfigurable     = (*Anthropic)(nil)
 )

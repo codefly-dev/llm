@@ -13,6 +13,7 @@ package llm
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync/atomic"
 
 	"github.com/benbjohnson/clock"
@@ -35,12 +36,45 @@ type OpenAI struct {
 	timeouts TimeoutConfig
 
 	lastUsage atomic.Pointer[Usage]
+
+	transportIdentity TransportIdentity
 }
 
 // NewOpenAI returns an OpenAI client for the given API key and model id.
 func NewOpenAI(apiKey, model string) *OpenAI {
 	sdk := openai.NewClient(option.WithAPIKey(apiKey))
-	return &OpenAI{sdk: sdk, model: model, clock: clock.New()}
+	return &OpenAI{
+		sdk:               sdk,
+		model:             model,
+		clock:             clock.New(),
+		transportIdentity: TransportIdentityDirectProvider,
+	}
+}
+
+func newOpenAIWithTransport(model string, transport providerTransport) *OpenAI {
+	options := []option.RequestOption{
+		option.WithBaseURL(transport.baseURL),
+		option.WithAPIKey(""),
+		option.WithHeaderDel("Authorization"),
+		option.WithHeaderDel("OpenAI-Organization"),
+		option.WithHeaderDel("OpenAI-Project"),
+	}
+	headerNames := make([]string, 0, len(transport.staticHeaders))
+	for name := range transport.staticHeaders {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	for _, name := range headerNames {
+		options = append(options, option.WithHeader(name, transport.staticHeaders[name]))
+	}
+	options = append(options, option.WithHeader(transport.authHeader, transport.credential))
+	sdk := openai.NewClient(options...)
+	return &OpenAI{
+		sdk:               sdk,
+		model:             model,
+		clock:             clock.New(),
+		transportIdentity: transport.identity,
+	}
 }
 
 // SetTimeouts implements TimeoutConfigurable. Call it during client
@@ -60,6 +94,12 @@ func (c *OpenAI) classify(err error) error {
 func (c *OpenAI) Provider() string { return "openai" }
 
 func (c *OpenAI) Model() string { return c.model }
+func (c *OpenAI) TransportIdentity() TransportIdentity {
+	if c.transportIdentity == "" {
+		return TransportIdentityDirectProvider
+	}
+	return c.transportIdentity
+}
 
 // LastCallUsage returns token counts from the most recent call, including
 // the cached-prompt subset OpenAI reports via prompt_tokens_details.
@@ -247,5 +287,6 @@ var (
 	_ EventStreamClient   = (*OpenAI)(nil)
 	_ UsageProvider       = (*OpenAI)(nil)
 	_ ProviderMeta        = (*OpenAI)(nil)
+	_ TransportMeta       = (*OpenAI)(nil)
 	_ TimeoutConfigurable = (*OpenAI)(nil)
 )

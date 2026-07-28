@@ -37,9 +37,9 @@ type ProviderSpec struct {
 	// provider name ("anthropic") without "/model".
 	DefaultModel string
 
-	// Factory constructs the provider's Client from a resolved API key and
-	// model id. Called after replay-only checks and key resolution.
-	Factory func(apiKey, model string) Client
+	// Factory constructs the provider's Client from a resolved provider API key
+	// or gateway transport and model id.
+	Factory func(apiKey, model string, transport *providerTransport) Client
 }
 
 var registry = map[string]ProviderSpec{
@@ -48,14 +48,24 @@ var registry = map[string]ProviderSpec{
 		EnvKey:       "ANTHROPIC_API_KEY",
 		CredKind:     CredKindAnthropicAPI,
 		DefaultModel: AnthropicModelSonnet,
-		Factory:      func(key, model string) Client { return NewAnthropic(key, model) },
+		Factory: func(key, model string, transport *providerTransport) Client {
+			if transport != nil {
+				return newAnthropicWithTransport(model, *transport)
+			}
+			return NewAnthropic(key, model)
+		},
 	},
 	"openai": {
 		Name:         "openai",
 		EnvKey:       "OPENAI_API_KEY",
 		CredKind:     CredKindOpenAIAPI,
 		DefaultModel: OpenAIModelGPT56Terra,
-		Factory:      func(key, model string) Client { return NewOpenAI(key, model) },
+		Factory: func(key, model string, transport *providerTransport) Client {
+			if transport != nil {
+				return newOpenAIWithTransport(model, *transport)
+			}
+			return NewOpenAI(key, model)
+		},
 	},
 }
 
