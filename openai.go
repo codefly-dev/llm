@@ -20,14 +20,16 @@ import (
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
+	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
 
 // OpenAI is the Mind-facing client for GPT models.
 type OpenAI struct {
-	sdk   openai.Client
-	model string
-	clock clock.Clock
+	chat      openai.ChatService
+	responses responses.ResponseService
+	model     string
+	clock     clock.Clock
 
 	// timeouts applies the same provider-attempt discipline used by
 	// Anthropic. The OpenAI SDK has no end-to-end request deadline of its
@@ -44,7 +46,8 @@ type OpenAI struct {
 func NewOpenAI(apiKey, model string) *OpenAI {
 	sdk := openai.NewClient(option.WithAPIKey(apiKey))
 	return &OpenAI{
-		sdk:               sdk,
+		chat:              sdk.Chat,
+		responses:         sdk.Responses,
 		model:             model,
 		clock:             clock.New(),
 		transportIdentity: TransportIdentityDirectProvider,
@@ -54,10 +57,6 @@ func NewOpenAI(apiKey, model string) *OpenAI {
 func newOpenAIWithTransport(model string, transport providerTransport) *OpenAI {
 	options := []option.RequestOption{
 		option.WithBaseURL(transport.baseURL),
-		option.WithAPIKey(""),
-		option.WithHeaderDel("Authorization"),
-		option.WithHeaderDel("OpenAI-Organization"),
-		option.WithHeaderDel("OpenAI-Project"),
 	}
 	headerNames := make([]string, 0, len(transport.staticHeaders))
 	for name := range transport.staticHeaders {
@@ -68,9 +67,9 @@ func newOpenAIWithTransport(model string, transport providerTransport) *OpenAI {
 		options = append(options, option.WithHeader(name, transport.staticHeaders[name]))
 	}
 	options = append(options, option.WithHeader(transport.authHeader, transport.credential))
-	sdk := openai.NewClient(options...)
 	return &OpenAI{
-		sdk:               sdk,
+		chat:              openai.NewChatService(options...),
+		responses:         responses.NewResponseService(options...),
 		model:             model,
 		clock:             clock.New(),
 		transportIdentity: transport.identity,
@@ -226,7 +225,7 @@ func (c *OpenAI) runStream(
 	guard := newStreamGuard(ctx, c.timeouts, "openai", c.model, c.clock)
 	defer guard.close()
 
-	stream := c.sdk.Chat.Completions.NewStreaming(guard.ctx(), params)
+	stream := c.chat.Completions.NewStreaming(guard.ctx(), params)
 	defer func() { _ = stream.Close() }()
 
 	var full []byte

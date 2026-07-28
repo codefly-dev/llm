@@ -23,6 +23,27 @@ func TestRegistry_ResolveProviderSpec(t *testing.T) {
 	}
 }
 
+func TestProviderSpecFactoryKeepsPublicSignature(t *testing.T) {
+	probe := newTransportProbe("factory response")
+	spec := ProviderSpec{
+		Factory: func(apiKey, model string) Client {
+			if apiKey != "provider-key" || model != "provider-model" {
+				t.Fatalf("factory arguments = %q, %q", apiKey, model)
+			}
+			return probe
+		},
+	}
+
+	client := spec.Factory("provider-key", "provider-model")
+	response, err := client.Call(t.Context(), "prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response != "factory response" {
+		t.Fatalf("factory response = %q", response)
+	}
+}
+
 func TestExplicitKeyFor(t *testing.T) {
 	opts := Options{
 		AnthropicAPIKey: "akey",

@@ -153,12 +153,13 @@ func WithCredentialStore(cs APIKeyStore) ClientOption {
 // WithTransportProfile routes a built-in provider through a compatible
 // gateway. Its credential is resolved through WithCredentialStore.
 func WithTransportProfile(profile ProviderTransportProfile) ClientOption {
+	staticHeaders := make(map[string]string, len(profile.StaticHeaders))
+	for name, value := range profile.StaticHeaders {
+		staticHeaders[name] = value
+	}
+	profile.StaticHeaders = staticHeaders
 	return func(b *clientBuilder) {
 		copy := profile
-		copy.StaticHeaders = make(map[string]string, len(profile.StaticHeaders))
-		for name, value := range profile.StaticHeaders {
-			copy.StaticHeaders[name] = value
-		}
 		b.transport = &copy
 	}
 }
@@ -246,7 +247,11 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 			}
 		}
 		if !replayOnly {
-			inner = spec.Factory(key, modelName, transport)
+			if transport != nil {
+				inner = spec.transportFactory(modelName, *transport)
+			} else {
+				inner = spec.Factory(key, modelName)
+			}
 		}
 	}
 	if replayOnly {

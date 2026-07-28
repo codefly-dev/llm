@@ -8,12 +8,14 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -38,6 +40,26 @@ func gatewayProfile(baseURL string) ProviderTransportProfile {
 			"X-Gateway-Protocol": "provider-compatible",
 		},
 		AllowInsecureLocalhost: true,
+	}
+}
+
+func assertSecretAbsent(t *testing.T, text, secret string) {
+	t.Helper()
+	representation := secret
+	seen := map[string]struct{}{}
+	for range 3 {
+		if _, ok := seen[representation]; ok {
+			break
+		}
+		seen[representation] = struct{}{}
+		if strings.Contains(text, representation) {
+			t.Fatalf("secret representation %q appears in %q", representation, text)
+		}
+		encoded, err := json.Marshal(representation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		representation = string(encoded[1 : len(encoded)-1])
 	}
 }
 
@@ -364,10 +386,11 @@ func TestOpenAIGatewayTransportUsesCompatibleBaseAndGatewayAuth(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("OPENAI_BASE_URL", "https://invalid.example/%zz")
 	t.Setenv("OPENAI_API_KEY", "vendor-secret-that-must-not-be-used")
 	t.Setenv("OPENAI_ORG_ID", "environment-org")
 	t.Setenv("OPENAI_PROJECT_ID", "environment-project")
+	t.Setenv("OPENAI_WEBHOOK_SECRET", "environment-webhook-secret")
 	profile := gatewayProfile(server.URL + "/compatible/v1")
 	client, err := NewClient(
 		Model("openai/"+OpenAIModelGPT56Terra),
@@ -399,13 +422,116 @@ func TestOpenAIGatewayTransportUsesCompatibleBaseAndGatewayAuth(t *testing.T) {
 	}
 }
 
+func TestGatewayTransportPreservesHostedWebSearchCapability(t *testing.T) {
+	profile := gatewayProfile("http://127.0.0.1:1")
+	store := transportCredentialStore{values: map[CredKind]string{
+		profile.Authentication.CredentialKind: "gateway-credential",
+	}}
+
+	anthropicClient, err := NewClient(
+		Model("anthropic/"+AnthropicModelHaiku),
+		Options{},
+		WithTransportProfile(profile),
+		WithCredentialStore(store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if FindWebSearcher(anthropicClient) == nil {
+		t.Fatal("Anthropic gateway lost hosted web search")
+	}
+
+	openAIClient, err := NewClient(
+		Model("openai/"+OpenAIModelGPT56Terra),
+		Options{},
+		WithTransportProfile(profile),
+		WithCredentialStore(store),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if searcher := FindWebSearcher(openAIClient); searcher != nil {
+		t.Fatalf("OpenAI gateway advertised unsupported hosted web search through %T", searcher)
+	}
+}
+
+func TestWithTransportProfileSnapshotsStaticHeaders(t *testing.T) {
+	const credential = "snapshot-gateway-credential"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Gateway-Protocol"); got != "original" {
+			t.Errorf("static header = %q, want original snapshot", got)
+		}
+		sseHeaders(w)
+		writeSSE(w, "", `{"id":"chatcmpl_snapshot","object":"chat.completion.chunk","created":1,"model":"gpt-5.6-terra","choices":[{"index":0,"delta":{"content":"snapshot"},"finish_reason":null}]}`)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	profile := gatewayProfile(server.URL + "/v1")
+	profile.StaticHeaders["X-Gateway-Protocol"] = "original"
+	transportOption := WithTransportProfile(profile)
+	profile.StaticHeaders["X-Gateway-Protocol"] = "mutated"
+
+	client, err := NewClient(
+		Model("openai/"+OpenAIModelGPT56Terra),
+		Options{},
+		transportOption,
+		WithCredentialStore(transportCredentialStore{values: map[CredKind]string{
+			profile.Authentication.CredentialKind: credential,
+		}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Stream(t.Context(), "use captured profile", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response != "snapshot" {
+		t.Fatalf("response = %q", response)
+	}
+}
+
+func TestGatewayErrorRedactionPreservesSafeTransportCause(t *testing.T) {
+	cause := &url.Error{
+		Op:  "Post",
+		URL: "https://gateway.example.com/v1/messages",
+		Err: context.DeadlineExceeded,
+	}
+	err := redactTransportError(&ProviderError{
+		Provider: "anthropic",
+		Code:     CodeTimeout,
+		Message:  cause.Error(),
+		Wrapped:  cause,
+	}, "gateway-credential")
+
+	var unwrapped *url.Error
+	if !errors.As(err, &unwrapped) {
+		t.Fatalf("gateway error no longer unwraps to its transport cause: %T", err)
+	}
+	if unwrapped != cause {
+		t.Fatal("safe transport cause identity was not preserved")
+	}
+}
+
 func TestGatewaySecretsAreRedactedFromErrorsAndCassettes(t *testing.T) {
-	const credential = "gateway-credential-must-stay-secret"
+	const credential = "gateway-credential-\"quoted\\slash<&>"
+	encodedCredential, err := json.Marshal(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gatewayEncodedCredential := strings.ReplaceAll(
+		string(encodedCredential[1:len(encodedCredential)-1]),
+		`\"`,
+		`\u0022`,
+	)
+	responseBody := `{"type":"error","error":{"type":"authentication_error","message":"rejected ` +
+		gatewayEncodedCredential + `"}}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Request-ID", credential)
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"authentication_error","message":"rejected %s"}}`, credential)
+		_, _ = w.Write([]byte(responseBody))
 	}))
 	defer server.Close()
 
@@ -431,8 +557,23 @@ func TestGatewaySecretsAreRedactedFromErrorsAndCassettes(t *testing.T) {
 		t.Fatalf("classified error = %v", err)
 	}
 	formattedError := fmt.Sprintf("%v\n%+v\n%#v", err, err, err)
-	if strings.Contains(formattedError, credential) {
-		t.Fatalf("formatted error leaked gateway credential: %s", formattedError)
+	assertSecretAbsent(t, formattedError, credential)
+	assertSecretAbsent(t, formattedError, gatewayEncodedCredential)
+
+	var sdkErr *anthropic.Error
+	if !errors.As(err, &sdkErr) {
+		t.Fatalf("gateway error no longer unwraps to the Anthropic SDK error: %T", err)
+	}
+	for name, diagnostic := range map[string]string{
+		"error":         sdkErr.Error(),
+		"raw JSON":      sdkErr.RawJSON(),
+		"request dump":  string(sdkErr.DumpRequest(false)),
+		"response dump": string(sdkErr.DumpResponse(false)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertSecretAbsent(t, diagnostic, credential)
+			assertSecretAbsent(t, diagnostic, gatewayEncodedCredential)
+		})
 	}
 
 	cassetteFiles := 0
@@ -445,9 +586,8 @@ func TestGatewaySecretsAreRedactedFromErrorsAndCassettes(t *testing.T) {
 		if readErr != nil {
 			return readErr
 		}
-		if strings.Contains(string(data), credential) {
-			t.Fatalf("cassette %s leaked gateway credential", path)
-		}
+		assertSecretAbsent(t, string(data), credential)
+		assertSecretAbsent(t, string(data), gatewayEncodedCredential)
 		return nil
 	})
 	if err != nil {

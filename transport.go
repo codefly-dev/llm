@@ -2,12 +2,17 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+
+	anthropic "github.com/anthropics/anthropic-sdk-go"
+	openai "github.com/openai/openai-go"
 )
 
 // TransportIdentity identifies whether provider traffic goes to the provider
@@ -269,35 +274,163 @@ func diagnosticBaseURL(raw string) string {
 	return parsed.String()
 }
 
-func redactTransportError(err error, credential string) error {
-	if err == nil || credential == "" {
-		return err
+func redactCredential(text, credential string) string {
+	if text == "" || credential == "" {
+		return text
 	}
-	redact := func(text string) string {
-		return strings.ReplaceAll(text, credential, "[REDACTED]")
+	forms := []string{credential}
+	if encoded, err := json.Marshal(credential); err == nil && len(encoded) >= 2 {
+		forms = append(forms, string(encoded[1:len(encoded)-1]))
 	}
-	var providerErr *ProviderError
-	if errors.As(err, &providerErr) {
-		safe := *providerErr
-		safe.Message = redact(providerErr.Message)
-		safe.RequestID = redact(providerErr.RequestID)
-		wrappedMessage := safe.Message
-		if providerErr.Wrapped != nil {
-			wrappedMessage = redact(providerErr.Wrapped.Error())
+	sort.SliceStable(forms, func(i, j int) bool {
+		return len(forms[i]) > len(forms[j])
+	})
+	seen := make(map[string]struct{}, len(forms))
+	for _, form := range forms {
+		if form == "" {
+			continue
 		}
-		switch {
-		case errors.Is(providerErr.Wrapped, ErrStreamStalled):
-			safe.Wrapped = fmt.Errorf("%w: %s", ErrStreamStalled, wrappedMessage)
-		case errors.Is(providerErr.Wrapped, context.DeadlineExceeded):
-			safe.Wrapped = fmt.Errorf("%w: %s", context.DeadlineExceeded, wrappedMessage)
-		case errors.Is(providerErr.Wrapped, context.Canceled):
-			safe.Wrapped = fmt.Errorf("%w: %s", context.Canceled, wrappedMessage)
-		default:
-			safe.Wrapped = errors.New(wrappedMessage)
+		if _, ok := seen[form]; ok {
+			continue
 		}
-		return &safe
+		seen[form] = struct{}{}
+		text = strings.ReplaceAll(text, form, "[REDACTED]")
 	}
-	message := redact(err.Error())
+	return text
+}
+
+func redactHTTPHeader(header http.Header, credential string) http.Header {
+	if header == nil {
+		return nil
+	}
+	safe := header.Clone()
+	for name, values := range safe {
+		for i, value := range values {
+			values[i] = redactCredential(value, credential)
+		}
+		safe[name] = values
+	}
+	return safe
+}
+
+func redactHTTPRequest(request *http.Request, credential string) *http.Request {
+	if request == nil {
+		return nil
+	}
+	safe := request.Clone(request.Context())
+	safe.Header = redactHTTPHeader(request.Header, credential)
+	safe.Trailer = redactHTTPHeader(request.Trailer, credential)
+	safe.Host = redactCredential(request.Host, credential)
+	if request.URL != nil {
+		redactedURL, err := url.Parse(redactCredential(request.URL.String(), credential))
+		if err == nil {
+			safe.URL = redactedURL
+		} else {
+			safe.URL = &url.URL{Path: "[REDACTED]"}
+		}
+	}
+	return safe
+}
+
+func redactHTTPResponse(response *http.Response, credential string) *http.Response {
+	if response == nil {
+		return nil
+	}
+	safe := new(http.Response)
+	*safe = *response
+	safe.Header = redactHTTPHeader(response.Header, credential)
+	safe.Trailer = redactHTTPHeader(response.Trailer, credential)
+	safe.Status = redactCredential(response.Status, credential)
+	safe.Request = redactHTTPRequest(response.Request, credential)
+	safe.Body = http.NoBody
+	safe.ContentLength = 0
+	safe.Header.Del("Content-Length")
+	return safe
+}
+
+func redactJSONCredential(raw, credential string) (string, error) {
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return "", err
+	}
+	var redactValue func(any) any
+	redactValue = func(value any) any {
+		switch value := value.(type) {
+		case string:
+			return strings.ReplaceAll(value, credential, "[REDACTED]")
+		case []any:
+			for i, item := range value {
+				value[i] = redactValue(item)
+			}
+		case map[string]any:
+			safe := make(map[string]any, len(value))
+			for name, item := range value {
+				safe[strings.ReplaceAll(name, credential, "[REDACTED]")] = redactValue(item)
+			}
+			return safe
+		}
+		return value
+	}
+	encoded, err := json.Marshal(redactValue(value))
+	return string(encoded), err
+}
+
+func redactAnthropicError(source *anthropic.Error, credential string) error {
+	safe := *source
+	raw := source.RawJSON()
+	if raw != "" {
+		redactedRaw, err := redactJSONCredential(raw, credential)
+		if err != nil {
+			return errors.New("anthropic SDK error redacted")
+		}
+		var rebuilt anthropic.Error
+		if err := json.Unmarshal([]byte(redactedRaw), &rebuilt); err != nil {
+			return errors.New("anthropic SDK error redacted")
+		}
+		safe = rebuilt
+	}
+	safe.StatusCode = source.StatusCode
+	safe.Request = redactHTTPRequest(source.Request, credential)
+	safe.Response = redactHTTPResponse(source.Response, credential)
+	safe.RequestID = redactCredential(source.RequestID, credential)
+	return &safe
+}
+
+func redactOpenAIError(source *openai.Error, credential string) error {
+	safe := *source
+	raw := source.RawJSON()
+	if raw != "" {
+		redactedRaw, err := redactJSONCredential(raw, credential)
+		if err != nil {
+			return errors.New("openai SDK error redacted")
+		}
+		var rebuilt openai.Error
+		if err := json.Unmarshal([]byte(redactedRaw), &rebuilt); err != nil {
+			return errors.New("openai SDK error redacted")
+		}
+		safe = rebuilt
+	}
+	safe.StatusCode = source.StatusCode
+	safe.Request = redactHTTPRequest(source.Request, credential)
+	safe.Response = redactHTTPResponse(source.Response, credential)
+	return &safe
+}
+
+func redactWrappedTransportError(err error, credential string) error {
+	if err == nil {
+		return nil
+	}
+	message := redactCredential(err.Error(), credential)
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		return redactAnthropicError(anthropicErr, credential)
+	}
+	var openAIErr *openai.Error
+	if errors.As(err, &openAIErr) {
+		return redactOpenAIError(openAIErr, credential)
+	}
 	if message == err.Error() {
 		return err
 	}
@@ -313,13 +446,43 @@ func redactTransportError(err error, credential string) error {
 	}
 }
 
+func redactTransportError(err error, credential string) error {
+	if err == nil || credential == "" {
+		return err
+	}
+	redact := func(text string) string {
+		return redactCredential(text, credential)
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) {
+		safe := *providerErr
+		safe.Message = redact(providerErr.Message)
+		safe.RequestID = redact(providerErr.RequestID)
+		safe.Wrapped = redactWrappedTransportError(providerErr.Wrapped, credential)
+		var anthropicErr *anthropic.Error
+		var openAIErr *openai.Error
+		if errors.As(providerErr.Wrapped, &anthropicErr) || errors.As(providerErr.Wrapped, &openAIErr) {
+			safe.Message = safe.Wrapped.Error()
+		}
+		return &safe
+	}
+	return redactWrappedTransportError(err, credential)
+}
+
 type transportRedactionClient struct {
 	next       Client
 	credential string
 }
 
 func redactTransportErrors(next Client, credential string) Client {
-	return &transportRedactionClient{next: next, credential: credential}
+	redacted := &transportRedactionClient{next: next, credential: credential}
+	if searcher := FindWebSearcher(next); searcher != nil {
+		return &transportRedactionWebSearchClient{
+			transportRedactionClient: redacted,
+			searcher:                 searcher,
+		}
+	}
+	return redacted
 }
 
 func (c *transportRedactionClient) Call(ctx context.Context, prompt string) (string, error) {
@@ -376,7 +539,7 @@ func (c *transportRedactionClient) StreamEvents(ctx context.Context, req StreamR
 		defer close(safeEvents)
 		for event := range events {
 			if event.Error != "" {
-				event.Error = strings.ReplaceAll(event.Error, c.credential, "[REDACTED]")
+				event.Error = redactCredential(event.Error, c.credential)
 			}
 			select {
 			case safeEvents <- event:
@@ -388,16 +551,17 @@ func (c *transportRedactionClient) StreamEvents(ctx context.Context, req StreamR
 	return safeEvents, nil
 }
 
-func (c *transportRedactionClient) WebSearch(ctx context.Context, query string, maxResults int) (WebSearchResult, error) {
-	searcher := FindWebSearcher(c.next)
-	if searcher == nil {
-		return WebSearchResult{}, fmt.Errorf("llm: client %T does not implement hosted web search", c.next)
-	}
-	result, err := searcher.WebSearch(ctx, query, maxResults)
-	return result, redactTransportError(err, c.credential)
+func (c *transportRedactionClient) Unwrap() Client { return c.next }
+
+type transportRedactionWebSearchClient struct {
+	*transportRedactionClient
+	searcher HostedWebSearcher
 }
 
-func (c *transportRedactionClient) Unwrap() Client { return c.next }
+func (c *transportRedactionWebSearchClient) WebSearch(ctx context.Context, query string, maxResults int) (WebSearchResult, error) {
+	result, err := c.searcher.WebSearch(ctx, query, maxResults)
+	return result, redactTransportError(err, c.credential)
+}
 
 var (
 	_ Client                  = (*transportRedactionClient)(nil)
@@ -407,5 +571,5 @@ var (
 	_ ToolClient              = (*transportRedactionClient)(nil)
 	_ OptionedToolClient      = (*transportRedactionClient)(nil)
 	_ EventStreamClient       = (*transportRedactionClient)(nil)
-	_ HostedWebSearcher       = (*transportRedactionClient)(nil)
+	_ HostedWebSearcher       = (*transportRedactionWebSearchClient)(nil)
 )
