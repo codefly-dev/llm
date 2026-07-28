@@ -25,7 +25,7 @@ func (c *OpenAI) callResponsesWithTools(ctx context.Context, system string, mess
 	attemptCtx, cancelAttempt := timeouts.attemptContext(ctx)
 	defer cancelAttempt()
 
-	resp, err := c.sdk.Responses.New(attemptCtx, params)
+	resp, err := c.responses.New(attemptCtx, params)
 	if err != nil {
 		if ctx.Err() == nil && attemptCtx.Err() != nil {
 			return Message{}, c.classify(fmt.Errorf("openai: per-attempt timeout %s exceeded: %w (request error: %v)", timeouts.PerAttempt, context.DeadlineExceeded, err))

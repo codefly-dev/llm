@@ -38,6 +38,7 @@ type clientBuilder struct {
 	provider       Provider
 	providerInfo   ModelInfo
 	creds          APIKeyStore
+	transport      *ProviderTransportProfile
 	circuitBreaker *CircuitBreakerConfig
 	timeouts       *TimeoutConfig
 }
@@ -142,9 +143,24 @@ func WithTimeouts(cfg TimeoutConfig) ClientOption {
 // WithCredentialStore resolves API keys via the credential store. Key lookup:
 //   - "anthropic_api_key" for Anthropic
 //   - "openai_api_key" for OpenAI
+//   - the profile's credential kind when WithTransportProfile is supplied
 func WithCredentialStore(cs APIKeyStore) ClientOption {
 	return func(b *clientBuilder) {
 		b.creds = cs
+	}
+}
+
+// WithTransportProfile routes a built-in provider through a compatible
+// gateway. Its credential is resolved through WithCredentialStore.
+func WithTransportProfile(profile ProviderTransportProfile) ClientOption {
+	staticHeaders := make(map[string]string, len(profile.StaticHeaders))
+	for name, value := range profile.StaticHeaders {
+		staticHeaders[name] = value
+	}
+	profile.StaticHeaders = staticHeaders
+	return func(b *clientBuilder) {
+		copy := profile
+		b.transport = &copy
 	}
 }
 
@@ -169,13 +185,19 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	var inner Client
 	var modelName string
 	var info ModelInfo
+	var transport *providerTransport
+	transportIdentity := TransportIdentityDirectProvider
 
 	// In replay-only mode the real provider is never called, so we can
 	// skip API key validation and use a no-op inner client.
 	replayOnly := b.recorder && b.recordMode == RecordReplayOnly
 
 	if b.provider != nil {
+		if b.transport != nil {
+			return nil, fmt.Errorf("transport profiles cannot be combined with custom providers")
+		}
 		inner = b.provider
+		transportIdentity = ClientTransportIdentity(inner)
 		modelName = opts.Model
 		if modelSuffix != "" {
 			modelName = modelSuffix
@@ -204,12 +226,32 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 		if modelErr != nil {
 			return nil, modelErr
 		}
-		key := resolveAPIKey(b.creds, explicitKeyFor(providerName, opts), spec.CredKind, spec.EnvKey)
-		if key == "" && !replayOnly {
-			return nil, fmt.Errorf("%s: API key not found. Run `mind setup` to configure, or ensure codefly injects %s into the credential store", providerName, spec.EnvKey)
+		var key string
+		if b.transport != nil {
+			transportIdentity = b.transport.Identity
+			if replayOnly {
+				if err := validateProviderTransportProfile(*b.transport); err != nil {
+					return nil, err
+				}
+			} else {
+				var transportErr error
+				transport, transportErr = resolveProviderTransport(*b.transport, b.creds)
+				if transportErr != nil {
+					return nil, transportErr
+				}
+			}
+		} else {
+			key = resolveAPIKey(b.creds, explicitKeyFor(providerName, opts), spec.CredKind, spec.EnvKey)
+			if key == "" && !replayOnly {
+				return nil, fmt.Errorf("%s: API key not found. Run `mind setup` to configure, or ensure codefly injects %s into the credential store", providerName, spec.EnvKey)
+			}
 		}
 		if !replayOnly {
-			inner = spec.Factory(key, modelName)
+			if transport != nil {
+				inner = spec.transportFactory(modelName, *transport)
+			} else {
+				inner = spec.Factory(key, modelName)
+			}
 		}
 	}
 	if replayOnly {
@@ -232,17 +274,18 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 
 	// OTEL is outermost so both replay and live calls have a span. The
 	// recorder sets llm.recorder on that span.
-	mws = append(mws, OTELMiddleware(fullModelName))
+	mws = append(mws, otelMiddleware(fullModelName, transportIdentity))
 
 	// Recorder sits outside live-call middleware. A replay hit must not spend
 	// budget, record usage, wait on rate limits, trip the circuit, or retry.
 	if b.recorder {
 		mws = append(mws, RecorderMiddlewareWithConfig(RecorderConfig{
-			Dir:   b.recorderDir,
-			Model: fullModelName,
-			Mode:  b.recordMode,
-			RunID: b.recorderRunID,
-			Clock: b.recorderClock,
+			Dir:               b.recorderDir,
+			Model:             fullModelName,
+			TransportIdentity: transportIdentity,
+			Mode:              b.recordMode,
+			RunID:             b.recorderRunID,
+			Clock:             b.recorderClock,
 		}))
 	}
 
@@ -255,6 +298,9 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	}
 	if configurable, ok := inner.(RuntimeClockConfigurable); ok {
 		configurable.SetRuntimeClock(runtimeClock)
+	}
+	if transport != nil {
+		inner = redactTransportErrors(inner, transport.credential)
 	}
 	var tracker *CostTracker
 	if b.costTracker != nil {

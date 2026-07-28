@@ -11,10 +11,10 @@ const (
 	CredKindOpenAIAPI    CredKind = "openai_api_key"
 )
 
-// APIKeyStore is the module's minimal view of a credential source: resolve a
-// provider API key by kind. Hosts (Mind, codefly) adapt their own secret
-// store to this interface. Returning ("", nil) means "not set" — the builder
-// falls back to any explicitly provided key.
+// APIKeyStore is the module's minimal view of a credential source: resolve an
+// API key by kind. Hosts (Mind, codefly) adapt their own secret store to this
+// interface. Returning ("", nil) means "not set" — the builder falls back to
+// any explicitly provided provider key.
 type APIKeyStore interface {
 	APIKey(ctx context.Context, kind CredKind) (string, error)
 }

@@ -37,31 +37,46 @@ type ProviderSpec struct {
 	// provider name ("anthropic") without "/model".
 	DefaultModel string
 
-	// Factory constructs the provider's Client from a resolved API key and
-	// model id. Called after replay-only checks and key resolution.
+	// Factory constructs the provider's Client from a resolved provider API key
+	// and model id.
 	Factory func(apiKey, model string) Client
 }
 
-var registry = map[string]ProviderSpec{
+type providerRegistration struct {
+	ProviderSpec
+	transportFactory func(model string, transport providerTransport) Client
+}
+
+var registry = map[string]providerRegistration{
 	"anthropic": {
-		Name:         "anthropic",
-		EnvKey:       "ANTHROPIC_API_KEY",
-		CredKind:     CredKindAnthropicAPI,
-		DefaultModel: AnthropicModelSonnet,
-		Factory:      func(key, model string) Client { return NewAnthropic(key, model) },
+		ProviderSpec: ProviderSpec{
+			Name:         "anthropic",
+			EnvKey:       "ANTHROPIC_API_KEY",
+			CredKind:     CredKindAnthropicAPI,
+			DefaultModel: AnthropicModelSonnet,
+			Factory:      func(key, model string) Client { return NewAnthropic(key, model) },
+		},
+		transportFactory: func(model string, transport providerTransport) Client {
+			return newAnthropicWithTransport(model, transport)
+		},
 	},
 	"openai": {
-		Name:         "openai",
-		EnvKey:       "OPENAI_API_KEY",
-		CredKind:     CredKindOpenAIAPI,
-		DefaultModel: OpenAIModelGPT56Terra,
-		Factory:      func(key, model string) Client { return NewOpenAI(key, model) },
+		ProviderSpec: ProviderSpec{
+			Name:         "openai",
+			EnvKey:       "OPENAI_API_KEY",
+			CredKind:     CredKindOpenAIAPI,
+			DefaultModel: OpenAIModelGPT56Terra,
+			Factory:      func(key, model string) Client { return NewOpenAI(key, model) },
+		},
+		transportFactory: func(model string, transport providerTransport) Client {
+			return newOpenAIWithTransport(model, transport)
+		},
 	},
 }
 
 // resolveProviderSpec looks up a provider by name. Returns false when the
 // name is not registered.
-func resolveProviderSpec(name string) (ProviderSpec, bool) {
+func resolveProviderSpec(name string) (providerRegistration, bool) {
 	s, ok := registry[name]
 	return s, ok
 }

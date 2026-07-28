@@ -13,20 +13,23 @@ package llm
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync/atomic"
 
 	"github.com/benbjohnson/clock"
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
+	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
 
 // OpenAI is the Mind-facing client for GPT models.
 type OpenAI struct {
-	sdk   openai.Client
-	model string
-	clock clock.Clock
+	chat      openai.ChatService
+	responses responses.ResponseService
+	model     string
+	clock     clock.Clock
 
 	// timeouts applies the same provider-attempt discipline used by
 	// Anthropic. The OpenAI SDK has no end-to-end request deadline of its
@@ -35,12 +38,42 @@ type OpenAI struct {
 	timeouts TimeoutConfig
 
 	lastUsage atomic.Pointer[Usage]
+
+	transportIdentity TransportIdentity
 }
 
 // NewOpenAI returns an OpenAI client for the given API key and model id.
 func NewOpenAI(apiKey, model string) *OpenAI {
 	sdk := openai.NewClient(option.WithAPIKey(apiKey))
-	return &OpenAI{sdk: sdk, model: model, clock: clock.New()}
+	return &OpenAI{
+		chat:              sdk.Chat,
+		responses:         sdk.Responses,
+		model:             model,
+		clock:             clock.New(),
+		transportIdentity: TransportIdentityDirectProvider,
+	}
+}
+
+func newOpenAIWithTransport(model string, transport providerTransport) *OpenAI {
+	options := []option.RequestOption{
+		option.WithBaseURL(transport.baseURL),
+	}
+	headerNames := make([]string, 0, len(transport.staticHeaders))
+	for name := range transport.staticHeaders {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	for _, name := range headerNames {
+		options = append(options, option.WithHeader(name, transport.staticHeaders[name]))
+	}
+	options = append(options, option.WithHeader(transport.authHeader, transport.credential))
+	return &OpenAI{
+		chat:              openai.NewChatService(options...),
+		responses:         responses.NewResponseService(options...),
+		model:             model,
+		clock:             clock.New(),
+		transportIdentity: transport.identity,
+	}
 }
 
 // SetTimeouts implements TimeoutConfigurable. Call it during client
@@ -60,6 +93,12 @@ func (c *OpenAI) classify(err error) error {
 func (c *OpenAI) Provider() string { return "openai" }
 
 func (c *OpenAI) Model() string { return c.model }
+func (c *OpenAI) TransportIdentity() TransportIdentity {
+	if c.transportIdentity == "" {
+		return TransportIdentityDirectProvider
+	}
+	return c.transportIdentity
+}
 
 // LastCallUsage returns token counts from the most recent call, including
 // the cached-prompt subset OpenAI reports via prompt_tokens_details.
@@ -186,7 +225,7 @@ func (c *OpenAI) runStream(
 	guard := newStreamGuard(ctx, c.timeouts, "openai", c.model, c.clock)
 	defer guard.close()
 
-	stream := c.sdk.Chat.Completions.NewStreaming(guard.ctx(), params)
+	stream := c.chat.Completions.NewStreaming(guard.ctx(), params)
 	defer func() { _ = stream.Close() }()
 
 	var full []byte
@@ -247,5 +286,6 @@ var (
 	_ EventStreamClient   = (*OpenAI)(nil)
 	_ UsageProvider       = (*OpenAI)(nil)
 	_ ProviderMeta        = (*OpenAI)(nil)
+	_ TransportMeta       = (*OpenAI)(nil)
 	_ TimeoutConfigurable = (*OpenAI)(nil)
 )

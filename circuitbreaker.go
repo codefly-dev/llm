@@ -180,6 +180,23 @@ func (m *circuitBreakerMW) StreamWithOptions(ctx context.Context, prompt string,
 	return resp, err
 }
 
+func (m *circuitBreakerMW) CallCached(ctx context.Context, system, user string) (string, error) {
+	return m.CallCachedWithOptions(ctx, system, user, RequestOptions{})
+}
+
+func (m *circuitBreakerMW) CallCachedWithOptions(ctx context.Context, system, user string, opts RequestOptions) (string, error) {
+	if err := m.checkState(); err != nil {
+		return "", err
+	}
+	resp, err := CallCachedWithOptions(ctx, m.next, system, user, opts)
+	if err != nil {
+		m.recordFailure()
+	} else {
+		m.recordSuccess()
+	}
+	return resp, err
+}
+
 func (m *circuitBreakerMW) CallWithTools(ctx context.Context, system string, messages []Message, tools []ToolDef) (Message, error) {
 	return m.CallWithToolsOptions(ctx, system, messages, tools, RequestOptions{})
 }

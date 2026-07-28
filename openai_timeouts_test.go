@@ -34,14 +34,16 @@ func TestOpenAIResponsesPerAttemptTimeout(t *testing.T) {
 	defer srv.Close()
 	defer close(releaseServer)
 
+	sdk := openai.NewClient(
+		option.WithAPIKey("timeout-certificate"),
+		option.WithBaseURL(srv.URL),
+		option.WithMaxRetries(0),
+	)
 	client := &OpenAI{
-		sdk: openai.NewClient(
-			option.WithAPIKey("timeout-certificate"),
-			option.WithBaseURL(srv.URL),
-			option.WithMaxRetries(0),
-		),
-		model: OpenAIModelGPT56Luna,
-		clock: clock.New(),
+		chat:      sdk.Chat,
+		responses: sdk.Responses,
+		model:     OpenAIModelGPT56Luna,
+		clock:     clock.New(),
 		timeouts: TimeoutConfig{
 			PerAttempt:  150 * time.Millisecond,
 			StreamStall: -1,

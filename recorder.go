@@ -25,15 +25,19 @@ import (
 
 // recording is the JSON structure stored on disk.
 type recording struct {
-	Model         string          `json:"model"`
-	RunID         string          `json:"run_id,omitempty"`
-	PromptHash    string          `json:"prompt_hash"`
-	PromptPreview string          `json:"prompt_preview"`
-	Response      string          `json:"response"`
-	ToolResponse  json.RawMessage `json:"tool_response,omitempty"`
-	Events        []StreamEvent   `json:"events,omitempty"`
-	Error         string          `json:"error,omitempty"`
-	RecordedAt    string          `json:"recorded_at"`
+	Model             string            `json:"model"`
+	TransportIdentity TransportIdentity `json:"transport_identity,omitempty"`
+	RunID             string            `json:"run_id,omitempty"`
+	PromptHash        string            `json:"prompt_hash"`
+	PromptPreview     string            `json:"prompt_preview"`
+	Request           string            `json:"request,omitempty"`
+	Response          string            `json:"response"`
+	TypedResponse     json.RawMessage   `json:"typed_response,omitempty"`
+	ToolResponse      json.RawMessage   `json:"tool_response,omitempty"`
+	Events            []StreamEvent     `json:"events,omitempty"`
+	Usage             *Usage            `json:"usage,omitempty"`
+	Error             string            `json:"error,omitempty"`
+	RecordedAt        string            `json:"recorded_at"`
 }
 
 type recordingKind string
@@ -57,11 +61,12 @@ func RecorderMiddleware(dir string, model string, mode RecordMode) Middleware {
 // injectable so recording metadata is byte-stable under replay/fixture tests;
 // nil selects a real clock for live recording.
 type RecorderConfig struct {
-	Dir   string
-	Model string
-	Mode  RecordMode
-	RunID string
-	Clock clock.Clock
+	Dir               string
+	Model             string
+	TransportIdentity TransportIdentity
+	Mode              RecordMode
+	RunID             string
+	Clock             clock.Clock
 }
 
 func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
@@ -81,13 +86,14 @@ func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
 	}
 	return func(next Client) Client {
 		return &recorderMW{
-			next:      next,
-			dir:       cfg.Dir,
-			model:     cfg.Model,
-			mode:      cfg.Mode,
-			runID:     runID,
-			clock:     recorderClock,
-			configErr: configErr,
+			next:              next,
+			dir:               cfg.Dir,
+			model:             cfg.Model,
+			transportIdentity: cfg.TransportIdentity,
+			mode:              cfg.Mode,
+			runID:             runID,
+			clock:             recorderClock,
+			configErr:         configErr,
 		}
 	}
 }
@@ -102,13 +108,20 @@ func RecorderMiddlewareWithRunID(dir string, model string, mode RecordMode, runI
 }
 
 type recorderMW struct {
-	next      Client
-	dir       string
-	model     string
-	mode      RecordMode
-	runID     string
-	clock     clock.Clock
-	configErr error
+	next              Client
+	dir               string
+	model             string
+	transportIdentity TransportIdentity
+	mode              RecordMode
+	runID             string
+	clock             clock.Clock
+	configErr         error
+	usageMu           sync.Mutex
+	lastUsage         *Usage
+	// liveMu keeps each recorded request paired with the provider's
+	// LastCallUsage value. Providers expose usage as last-call state, so live
+	// recording cannot safely overlap calls on one client.
+	liveMu sync.Mutex
 	// writeMu serializes recording writes: parallel-safe tool batches drive
 	// concurrent LLM/tool calls through ONE recorder, and two goroutines
 	// hitting the same hash raced on the cassette file (review B8).
@@ -139,6 +152,7 @@ func (m *recorderMW) CallWithOptions(ctx context.Context, prompt string, opts Re
 		if replayErr == nil {
 			span.SetAttributes(attribute.String("llm.recorder", "replay"))
 			m.dumpDebugKey("replay", hash, keyInput)
+			m.setLastUsage(resp.Usage)
 			return resp.Response, recordedError(resp)
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
@@ -150,6 +164,8 @@ func (m *recorderMW) CallWithOptions(ctx context.Context, prompt string, opts Re
 	if err := m.claim(path); err != nil {
 		return "", err
 	}
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
 	span.SetAttributes(attribute.String("llm.recorder", "record"))
 	resp, callErr := CallWithOptions(ctx, m.next, prompt, opts)
 	if writeErr := m.record(path, hash, keyInput, resp, callErr); writeErr != nil {
@@ -179,6 +195,7 @@ func (m *recorderMW) StreamWithOptions(ctx context.Context, prompt string, opts 
 		if replayErr == nil {
 			span.SetAttributes(attribute.String("llm.recorder", "replay"))
 			m.dumpDebugKey("replay", hash, keyInput)
+			m.setLastUsage(rec.Usage)
 			if onChunk != nil && rec.Response != "" {
 				if callbackErr := onChunk(rec.Response); callbackErr != nil {
 					return rec.Response, callbackErr
@@ -194,6 +211,8 @@ func (m *recorderMW) StreamWithOptions(ctx context.Context, prompt string, opts 
 	if err := m.claim(path); err != nil {
 		return "", err
 	}
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
 	span.SetAttributes(attribute.String("llm.recorder", "record"))
 	var callbackErr error
 	full, streamErr := StreamWithOptions(ctx, m.next, prompt, opts, func(text string) error {
@@ -234,6 +253,7 @@ func (m *recorderMW) CallCachedWithOptions(ctx context.Context, system, user str
 		rec, replayErr := m.replay(path, hash, recordingText)
 		if replayErr == nil {
 			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			m.setLastUsage(rec.Usage)
 			return rec.Response, recordedError(rec)
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
@@ -244,6 +264,8 @@ func (m *recorderMW) CallCachedWithOptions(ctx context.Context, system, user str
 	if err := m.claim(path); err != nil {
 		return "", err
 	}
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
 	span.SetAttributes(attribute.String("llm.recorder", "record"))
 	resp, callErr := CallCachedWithOptions(ctx, m.next, system, user, opts)
 	if writeErr := m.record(path, hash, keyInput, resp, callErr); writeErr != nil {
@@ -283,6 +305,7 @@ func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, me
 			}
 			span.SetAttributes(attribute.String("llm.recorder", "replay"))
 			m.dumpDebugKey("replay", hash, keyInput)
+			m.setLastUsage(rec.Usage)
 			return msg, recordedError(rec)
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
@@ -294,6 +317,8 @@ func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, me
 	if err := m.claim(path); err != nil {
 		return Message{}, err
 	}
+	m.liveMu.Lock()
+	defer m.liveMu.Unlock()
 	span.SetAttributes(attribute.String("llm.recorder", "record"))
 	resp, callErr := CallWithToolsOptions(ctx, m.next, system, messages, tools, opts)
 	if writeErr := m.recordToolCall(path, hash, keyInput, resp, callErr); writeErr != nil {
@@ -338,6 +363,7 @@ func (m *recorderMW) StreamEvents(ctx context.Context, req StreamRequest) (<-cha
 		rec, replayErr := m.replay(path, hash, recordingEvents)
 		if replayErr == nil {
 			span.SetAttributes(attribute.String("llm.recorder", "replay"))
+			m.setLastUsage(rec.Usage)
 			out := make(chan StreamEvent, len(rec.Events))
 			go func() {
 				defer close(out)
@@ -357,15 +383,18 @@ func (m *recorderMW) StreamEvents(ctx context.Context, req StreamRequest) (<-cha
 	if err := m.claim(path); err != nil {
 		return nil, err
 	}
+	m.liveMu.Lock()
 	span.SetAttributes(attribute.String("llm.recorder", "record"))
 	source, err := StreamEventsFromClient(ctx, m.next, req)
 	if err != nil {
+		m.liveMu.Unlock()
 		m.release(path)
 		return nil, err
 	}
 	out := make(chan StreamEvent, 16)
 	go func() {
 		defer close(out)
+		defer m.liveMu.Unlock()
 		var events []StreamEvent
 		for event := range source {
 			events = append(events, event)
@@ -440,6 +469,27 @@ func keyWithOptions(base string, opts RequestOptions) (string, error) {
 
 func (m *recorderMW) Unwrap() Client { return m.next }
 
+func (m *recorderMW) LastCallUsage() *Usage {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if m.lastUsage == nil {
+		return nil
+	}
+	usage := *m.lastUsage
+	return &usage
+}
+
+func (m *recorderMW) setLastUsage(usage *Usage) {
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	if usage == nil {
+		m.lastUsage = nil
+		return
+	}
+	copy := *usage
+	m.lastUsage = &copy
+}
+
 func (m *recorderMW) replay(path, hash string, kind recordingKind) (recording, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -466,6 +516,13 @@ func (m *recorderMW) replay(path, hash string, kind recordingKind) (recording, e
 func (m *recorderMW) record(path, hash, prompt, response string, callErr error) error {
 	rec := m.newRecording(hash, prompt)
 	rec.Response = response
+	if response != "" {
+		typedResponse := []byte(response)
+		if !json.Valid(typedResponse) {
+			typedResponse, _ = json.Marshal(response)
+		}
+		rec.TypedResponse = typedResponse
+	}
 	rec.Error = errorText(callErr)
 	return m.writeRecording(path, rec)
 }
@@ -484,13 +541,35 @@ func (m *recorderMW) newRecording(hash, keyInput string) recording {
 	if len(preview) > 200 {
 		preview = preview[:200] + "..."
 	}
+	usage := latestClientUsage(m.next)
+	m.setLastUsage(usage)
 	return recording{
-		Model:         m.model,
-		RunID:         m.runID,
-		PromptHash:    hash,
-		PromptPreview: preview,
-		RecordedAt:    m.clock.Now().UTC().Format(time.RFC3339Nano),
+		Model:             m.model,
+		TransportIdentity: m.transportIdentity,
+		RunID:             m.runID,
+		PromptHash:        hash,
+		PromptPreview:     preview,
+		Request:           keyInput,
+		Usage:             usage,
+		RecordedAt:        m.clock.Now().UTC().Format(time.RFC3339Nano),
 	}
+}
+
+func latestClientUsage(client Client) *Usage {
+	for client != nil {
+		if provider, ok := client.(UsageProvider); ok {
+			if usage := provider.LastCallUsage(); usage != nil {
+				copy := *usage
+				return &copy
+			}
+		}
+		unwrapper, ok := client.(interface{ Unwrap() Client })
+		if !ok {
+			return nil
+		}
+		client = unwrapper.Unwrap()
+	}
+	return nil
 }
 
 func (m *recorderMW) writeRecording(path string, rec recording) (retErr error) {
@@ -541,6 +620,9 @@ func (m *recorderMW) validateRecording(rec recording, hash string, kind recordin
 	if rec.Model != m.model {
 		return fmt.Errorf("model = %q, want %q", rec.Model, m.model)
 	}
+	if rec.TransportIdentity != "" && rec.TransportIdentity != m.transportIdentity {
+		return fmt.Errorf("transport_identity = %q, want %q", rec.TransportIdentity, m.transportIdentity)
+	}
 	if rec.RunID != m.runID {
 		return fmt.Errorf("run_id = %q, want %q", rec.RunID, m.runID)
 	}
@@ -556,11 +638,11 @@ func (m *recorderMW) validateRecording(rec recording, hash string, kind recordin
 			return fmt.Errorf("text recording contains a non-text response")
 		}
 	case recordingTool:
-		if rec.ToolResponse == nil || rec.Events != nil || rec.Response != "" {
+		if rec.ToolResponse == nil || rec.Events != nil || rec.Response != "" || rec.TypedResponse != nil {
 			return fmt.Errorf("tool recording has an invalid response shape")
 		}
 	case recordingEvents:
-		if len(rec.Events) == 0 || rec.ToolResponse != nil || rec.Response != "" {
+		if len(rec.Events) == 0 || rec.ToolResponse != nil || rec.Response != "" || rec.TypedResponse != nil {
 			return fmt.Errorf("event recording has an invalid response shape")
 		}
 	default:

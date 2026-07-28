@@ -16,13 +16,20 @@ import (
 // This captures Call, Stream, CallCached, and CallWithTools at the transport level.
 func OTELMiddleware(model string) Middleware {
 	return func(next Client) Client {
-		return &otelMW{next: next, model: model}
+		return &otelMW{next: next, model: model, transportIdentity: ClientTransportIdentity(next)}
+	}
+}
+
+func otelMiddleware(model string, transportIdentity TransportIdentity) Middleware {
+	return func(next Client) Client {
+		return &otelMW{next: next, model: model, transportIdentity: transportIdentity}
 	}
 }
 
 type otelMW struct {
-	next  Client
-	model string
+	next              Client
+	model             string
+	transportIdentity TransportIdentity
 }
 
 func (m *otelMW) Call(ctx context.Context, prompt string) (string, error) {
@@ -175,6 +182,9 @@ func (m *otelMW) CallWithToolsOptions(ctx context.Context, system string, messag
 }
 
 func (m *otelMW) Unwrap() Client { return m.next }
+func (m *otelMW) TransportIdentity() TransportIdentity {
+	return m.transportIdentity
+}
 
 func (m *otelMW) baseLLMAttrs(operation string) []attribute.KeyValue {
 	provider, modelName := providerAndModel(m.model)
@@ -185,6 +195,7 @@ func (m *otelMW) baseLLMAttrs(operation string) []attribute.KeyValue {
 		attribute.String("llm.provider", provider),
 		attribute.String("llm.model_name", modelName),
 		attribute.String("llm.operation", operation),
+		attribute.String("llm.transport.identity", string(m.transportIdentity)),
 	}
 }
 
