@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
+
+	openai "github.com/openai/openai-go"
 )
 
 func TestClassifyStatus_Buckets(t *testing.T) {
@@ -71,6 +74,32 @@ func TestClassifyOpenAI_UsesExactProviderName(t *testing.T) {
 	}
 }
 
+func TestClassifyOpenAI_QuotaExhaustionIsTerminal(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	apiErr := &openai.Error{
+		Code:       "insufficient_quota",
+		Message:    "You exceeded your current quota.",
+		Type:       "insufficient_quota",
+		StatusCode: http.StatusTooManyRequests,
+		Request:    req,
+		Response: &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     make(http.Header),
+		},
+	}
+
+	classified := classifyOpenAI(apiErr, time.Unix(0, 0).UTC())
+	if !errors.Is(classified, ErrQuotaExhausted) {
+		t.Fatalf("classified error = %v, want quota exhausted", classified)
+	}
+	if IsRetryable(classified) {
+		t.Fatalf("quota exhaustion must fail without retry, got %v", classified)
+	}
+}
+
 func TestIsRetryable_Sentinels(t *testing.T) {
 	// The retryable set is rate-limited, overloaded, server, timeout.
 	retryable := []*ProviderError{
@@ -87,6 +116,7 @@ func TestIsRetryable_Sentinels(t *testing.T) {
 
 	nonRetryable := []*ProviderError{
 		{Code: CodeUnauthorized},
+		{Code: CodeQuotaExhausted},
 		{Code: CodeBadRequest},
 		{Code: CodeUnknown},
 	}

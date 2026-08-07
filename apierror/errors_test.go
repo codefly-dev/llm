@@ -54,6 +54,7 @@ func TestIsRetryable(t *testing.T) {
 
 	nonRetryable := []error{
 		ErrUnauthorized,
+		ErrQuotaExhausted,
 		ErrBadRequest,
 		ErrContextLength,
 		ErrContentFiltered,

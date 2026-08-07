@@ -113,6 +113,11 @@ func refineAnthropicCode(code apierror.ErrorCode, err *anthropic.Error) apierror
 func refineOpenAICode(code apierror.ErrorCode, err *openai.Error) apierror.ErrorCode {
 	s := strings.ToLower(err.Code + " " + err.Type + " " + err.Message)
 	switch {
+	case strings.Contains(s, "insufficient_quota") || strings.Contains(s, "billing_hard_limit_reached"):
+		// OpenAI reports account-level billing exhaustion with HTTP 429, but
+		// retrying cannot recover it. Keep it distinct from transient request
+		// throttling so operators get the right remediation and retry policy.
+		return apierror.CodeQuotaExhausted
 	case strings.Contains(s, "context_length") || strings.Contains(s, "maximum context"):
 		return apierror.CodeContextLength
 	case strings.Contains(s, "content_filter") || strings.Contains(s, "moderation"):
