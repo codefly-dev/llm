@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
+
+	openai "github.com/openai/openai-go"
 )
 
 func TestClassifyStatus_Buckets(t *testing.T) {
@@ -71,6 +74,92 @@ func TestClassifyOpenAI_UsesExactProviderName(t *testing.T) {
 	}
 }
 
+func TestClassifyOpenAI_QuotaExhaustionIsTerminal(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	apiErr := &openai.Error{
+		Code:       "insufficient_quota",
+		Message:    "You exceeded your current quota.",
+		Type:       "insufficient_quota",
+		StatusCode: http.StatusTooManyRequests,
+		Request:    req,
+		Response: &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     make(http.Header),
+		},
+	}
+
+	classified := classifyOpenAI(apiErr, time.Unix(0, 0).UTC())
+	if !errors.Is(classified, ErrQuotaExhausted) {
+		t.Fatalf("classified error = %v, want quota exhausted", classified)
+	}
+	if IsRetryable(classified) {
+		t.Fatalf("quota exhaustion must fail without retry, got %v", classified)
+	}
+}
+
+// TestClassifyOpenAI_GatewayQuotaExhaustionIsTerminal covers OpenAI-compatible
+// gateways that forward the upstream billing message while stripping the
+// structured Code/Type fields. The billing-exhaustion phrase alone must still
+// classify as terminal so a proxied quota error does not get retried.
+func TestClassifyOpenAI_GatewayQuotaExhaustionIsTerminal(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://gateway.example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	apiErr := &openai.Error{
+		Message:    "You exceeded your current quota, please check your plan and billing details.",
+		StatusCode: http.StatusTooManyRequests,
+		Request:    req,
+		Response: &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     make(http.Header),
+		},
+	}
+
+	classified := classifyOpenAI(apiErr, time.Unix(0, 0).UTC())
+	if !errors.Is(classified, ErrQuotaExhausted) {
+		t.Fatalf("classified error = %v, want quota exhausted", classified)
+	}
+	if IsRetryable(classified) {
+		t.Fatalf("proxied quota exhaustion must fail without retry, got %v", classified)
+	}
+}
+
+// TestClassifyOpenAI_TransientRateLimitStaysRetryable guards against
+// over-matching the quota phrases: a genuine per-minute throttle carries no
+// billing-exhaustion text and must stay a retryable rate limit.
+func TestClassifyOpenAI_TransientRateLimitStaysRetryable(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	apiErr := &openai.Error{
+		Code:       "rate_limit_exceeded",
+		Type:       "requests",
+		Message:    "Rate limit reached for gpt-4o in organization org-123 on requests per min. Please try again in 20s.",
+		StatusCode: http.StatusTooManyRequests,
+		Request:    req,
+		Response: &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     make(http.Header),
+		},
+	}
+
+	classified := classifyOpenAI(apiErr, time.Unix(0, 0).UTC())
+	if errors.Is(classified, ErrQuotaExhausted) {
+		t.Fatalf("transient rate limit must not classify as quota exhausted, got %v", classified)
+	}
+	if !errors.Is(classified, ErrRateLimited) {
+		t.Fatalf("classified error = %v, want rate limited", classified)
+	}
+	if !IsRetryable(classified) {
+		t.Fatalf("transient rate limit must be retryable, got %v", classified)
+	}
+}
+
 func TestIsRetryable_Sentinels(t *testing.T) {
 	// The retryable set is rate-limited, overloaded, server, timeout.
 	retryable := []*ProviderError{
@@ -87,6 +176,7 @@ func TestIsRetryable_Sentinels(t *testing.T) {
 
 	nonRetryable := []*ProviderError{
 		{Code: CodeUnauthorized},
+		{Code: CodeQuotaExhausted},
 		{Code: CodeBadRequest},
 		{Code: CodeUnknown},
 	}

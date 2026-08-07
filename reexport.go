@@ -121,6 +121,7 @@ type (
 
 const (
 	CodeRateLimited     = apierror.CodeRateLimited
+	CodeQuotaExhausted  = apierror.CodeQuotaExhausted
 	CodeOverloaded      = apierror.CodeOverloaded
 	CodeServer          = apierror.CodeServer
 	CodeUnauthorized    = apierror.CodeUnauthorized
@@ -137,6 +138,7 @@ const (
 // errors.Is(err, llm.ErrRateLimited) etc.
 var (
 	ErrRateLimited     = apierror.ErrRateLimited
+	ErrQuotaExhausted  = apierror.ErrQuotaExhausted
 	ErrOverloaded      = apierror.ErrOverloaded
 	ErrServer          = apierror.ErrServer
 	ErrUnauthorized    = apierror.ErrUnauthorized

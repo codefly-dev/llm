@@ -11,6 +11,7 @@ type ErrorCode string
 
 const (
 	CodeRateLimited     ErrorCode = "rate_limited"
+	CodeQuotaExhausted  ErrorCode = "quota_exhausted"
 	CodeOverloaded      ErrorCode = "overloaded"
 	CodeServer          ErrorCode = "server_error"
 	CodeUnauthorized    ErrorCode = "unauthorized"
@@ -56,6 +57,7 @@ func (e *ProviderError) Is(target error) bool {
 
 var (
 	ErrRateLimited     = &ProviderError{Code: CodeRateLimited}
+	ErrQuotaExhausted  = &ProviderError{Code: CodeQuotaExhausted}
 	ErrOverloaded      = &ProviderError{Code: CodeOverloaded}
 	ErrServer          = &ProviderError{Code: CodeServer}
 	ErrUnauthorized    = &ProviderError{Code: CodeUnauthorized}
