@@ -113,10 +113,22 @@ func refineAnthropicCode(code apierror.ErrorCode, err *anthropic.Error) apierror
 func refineOpenAICode(code apierror.ErrorCode, err *openai.Error) apierror.ErrorCode {
 	s := strings.ToLower(err.Code + " " + err.Type + " " + err.Message)
 	switch {
-	case strings.Contains(s, "insufficient_quota") || strings.Contains(s, "billing_hard_limit_reached"):
+	case strings.Contains(s, "insufficient_quota") ||
+		strings.Contains(s, "billing_hard_limit_reached") ||
+		strings.Contains(s, "billing hard limit") ||
+		strings.Contains(s, "exceeded your current quota") ||
+		strings.Contains(s, "plan and billing"):
 		// OpenAI reports account-level billing exhaustion with HTTP 429, but
 		// retrying cannot recover it. Keep it distinct from transient request
 		// throttling so operators get the right remediation and retry policy.
+		//
+		// The machine codes (insufficient_quota, billing_hard_limit_reached)
+		// live in Code/Type, which OpenAI-compatible gateways often strip while
+		// forwarding the upstream message text. Match the billing-exhaustion
+		// phrases too so a proxied quota error is still terminal. These phrases
+		// are specific to account/billing exhaustion; transient per-minute
+		// throttling ("rate limit reached, try again in Ns") never contains
+		// them, so real rate limits still fall through to CodeRateLimited.
 		return apierror.CodeQuotaExhausted
 	case strings.Contains(s, "context_length") || strings.Contains(s, "maximum context"):
 		return apierror.CodeContextLength
