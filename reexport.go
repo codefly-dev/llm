@@ -150,6 +150,10 @@ var (
 	ErrTimeout         = apierror.ErrTimeout
 )
 
+// IsProviderTerminal distinguishes operator-controlled provider outages
+// (billing/credentials) from request-specific or transient failures.
+var IsProviderTerminal = apierror.IsProviderTerminal
+
 // IsRetryable is true for rate-limit, overloaded, server, and timeout errors.
 func IsRetryable(err error) bool {
 	return apierror.IsRetryable(err)
