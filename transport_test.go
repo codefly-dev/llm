@@ -598,6 +598,66 @@ func TestGatewaySecretsAreRedactedFromErrorsAndCassettes(t *testing.T) {
 	}
 }
 
+func TestDirectProviderSecretsAreRedactedFromErrorsAndCassettes(t *testing.T) {
+	const credential = `direct-provider-credential-"quoted\slash<&>`
+	providerErr := &ProviderError{
+		Provider:  "openai",
+		Code:      CodeUnauthorized,
+		Status:    http.StatusUnauthorized,
+		Message:   "provider rejected " + credential,
+		RequestID: credential,
+		Wrapped:   errors.New("direct provider transport echoed " + credential),
+	}
+	inner := &recorderInfraClient{err: providerErr}
+	cassetteDir := t.TempDir()
+	client := RecorderMiddleware(cassetteDir, "openai/test-model", RecordAlways)(
+		protectProviderErrors(inner, credential, nil),
+	)
+
+	_, err := client.Call(t.Context(), "trigger classified direct-provider error")
+	if err == nil {
+		t.Fatal("expected direct-provider error")
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("classified error = %v", err)
+	}
+	var classified *ProviderError
+	if !errors.As(err, &classified) {
+		t.Fatalf("direct-provider error no longer exposes ProviderError: %T", err)
+	}
+	assertSecretAbsent(t, fmt.Sprintf("%v\n%+v\n%#v", err, err, err), credential)
+
+	cassetteFiles := 0
+	err = filepath.WalkDir(cassetteDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		cassetteFiles++
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		assertSecretAbsent(t, string(data), credential)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cassetteFiles != 1 {
+		t.Fatalf("direct-provider error cassette files = %d, want 1", cassetteFiles)
+	}
+
+	replayInner := &recorderInfraClient{response: Message{Content: "must not run"}}
+	replay := RecorderMiddleware(cassetteDir, "openai/test-model", RecordReplayOnly)(replayInner)
+	_, replayErr := replay.Call(t.Context(), "trigger classified direct-provider error")
+	if !errors.Is(replayErr, ErrUnauthorized) {
+		t.Fatalf("replay lost direct-provider classification: %v", replayErr)
+	}
+	if replayInner.calls != 0 {
+		t.Fatalf("replay called direct provider %d times", replayInner.calls)
+	}
+}
+
 func TestGatewayIdentityIsIncludedInTraceAttributes(t *testing.T) {
 	middleware := &otelMW{
 		model:             "anthropic/" + AnthropicModelHaiku,
