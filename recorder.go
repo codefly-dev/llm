@@ -16,6 +16,7 @@ import (
 
 	"github.com/benbjohnson/clock"
 	"github.com/codefly-dev/core/wool"
+	"github.com/codefly-dev/llm/apierror"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -36,8 +37,25 @@ type recording struct {
 	ToolResponse      json.RawMessage   `json:"tool_response,omitempty"`
 	Events            []StreamEvent     `json:"events,omitempty"`
 	Usage             *Usage            `json:"usage,omitempty"`
-	Error             string            `json:"error,omitempty"`
+	Error             *recordedFailure  `json:"error,omitempty"`
 	RecordedAt        string            `json:"recorded_at"`
+}
+
+// recordedFailure preserves the machine-readable provider classification that
+// controls retry and terminal behavior. Error text alone is not replay-safe:
+// rebuilding it with errors.New makes quota/auth failures look transient.
+type recordedFailure struct {
+	Message       string                 `json:"message"`
+	ProviderError *recordedProviderError `json:"provider_error,omitempty"`
+}
+
+type recordedProviderError struct {
+	Provider     string             `json:"provider"`
+	Code         apierror.ErrorCode `json:"code"`
+	Status       int                `json:"status,omitempty"`
+	Message      string             `json:"message"`
+	RequestID    string             `json:"request_id,omitempty"`
+	RetryAfterNS int64              `json:"retry_after_ns,omitempty"`
 }
 
 type recordingKind string
@@ -423,7 +441,7 @@ func (m *recorderMW) recordToolCall(path, hash, keyInput string, resp Message, c
 	}
 	rec := m.newRecording(hash, keyInput)
 	rec.ToolResponse = toolResp
-	rec.Error = errorText(callErr)
+	rec.Error = captureRecordedFailure(callErr)
 	return m.writeRecording(path, rec)
 }
 
@@ -523,7 +541,7 @@ func (m *recorderMW) record(path, hash, prompt, response string, callErr error) 
 		}
 		rec.TypedResponse = typedResponse
 	}
-	rec.Error = errorText(callErr)
+	rec.Error = captureRecordedFailure(callErr)
 	return m.writeRecording(path, rec)
 }
 
@@ -671,18 +689,54 @@ func (m *recorderMW) release(path string) {
 }
 
 func recordedError(rec recording) error {
-	if rec.Error == "" {
+	if rec.Error == nil {
 		return nil
 	}
-	return errors.New(rec.Error)
+	if rec.Error.ProviderError == nil {
+		return errors.New(rec.Error.Message)
+	}
+	provider := rec.Error.ProviderError
+	return replayedFailure{
+		message: rec.Error.Message,
+		cause: &apierror.ProviderError{
+			Provider:   provider.Provider,
+			Code:       provider.Code,
+			Status:     provider.Status,
+			Message:    provider.Message,
+			RequestID:  provider.RequestID,
+			RetryAfter: time.Duration(provider.RetryAfterNS),
+		},
+	}
 }
 
-func errorText(err error) string {
+func captureRecordedFailure(err error) *recordedFailure {
 	if err == nil {
-		return ""
+		return nil
 	}
-	return err.Error()
+	failure := &recordedFailure{Message: err.Error()}
+	var provider *apierror.ProviderError
+	if errors.As(err, &provider) {
+		failure.ProviderError = &recordedProviderError{
+			Provider:     provider.Provider,
+			Code:         provider.Code,
+			Status:       provider.Status,
+			Message:      provider.Message,
+			RequestID:    provider.RequestID,
+			RetryAfterNS: int64(provider.RetryAfter),
+		}
+	}
+	return failure
 }
+
+// replayedFailure retains the exact recorded text while exposing the typed
+// provider cause through errors.Is/errors.As to the production retry policy.
+type replayedFailure struct {
+	message string
+	cause   error
+}
+
+func (e replayedFailure) Error() string { return e.message }
+func (e replayedFailure) Unwrap() error { return e.cause }
 
 // hashKey is the exact model + request hash used by recorder filenames.
 func hashKey(model, prompt string) string {
