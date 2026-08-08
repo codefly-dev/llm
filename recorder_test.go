@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/clock"
+	"github.com/codefly-dev/llm/apierror"
 )
 
 func TestHashKey_Deterministic(t *testing.T) {
@@ -467,6 +468,46 @@ func TestRecorderRecordsProviderErrorAndReplaysWithoutLiveCall(t *testing.T) {
 	response, err = replay.Call(t.Context(), "error outcome")
 	if response != "partial" || err == nil || err.Error() != providerErr.Error() {
 		t.Fatalf("replay = %q, %v", response, err)
+	}
+	if replayInner.calls != 0 {
+		t.Fatalf("replay called live provider %d times", replayInner.calls)
+	}
+}
+
+func TestRecorderReplaysTypedProviderErrorClassification(t *testing.T) {
+	dir := t.TempDir()
+	providerErr := &apierror.ProviderError{
+		Provider:   "openai",
+		Code:       apierror.CodeQuotaExhausted,
+		Status:     429,
+		Message:    "credits exhausted",
+		RequestID:  "request-123",
+		RetryAfter: 3 * time.Second,
+	}
+	recordInner := &recorderInfraClient{err: fmt.Errorf("typed call provider: %w", providerErr)}
+	record := RecorderMiddleware(dir, "test-model", RecordAlways)(recordInner)
+	_, recordErr := record.(*recorderMW).CallWithTools(t.Context(), "system", nil, nil)
+	if !errors.Is(recordErr, apierror.ErrQuotaExhausted) {
+		t.Fatalf("record error = %v, want quota-exhausted classification", recordErr)
+	}
+
+	replayInner := &recorderInfraClient{response: Message{Content: "must not run"}}
+	replay := RecorderMiddleware(dir, "test-model", RecordReplayOnly)(replayInner)
+	_, replayErr := replay.(*recorderMW).CallWithTools(t.Context(), "system", nil, nil)
+	if replayErr == nil || replayErr.Error() != recordErr.Error() {
+		t.Fatalf("replay error = %v, want exact %q", replayErr, recordErr)
+	}
+	if !apierror.IsProviderTerminal(replayErr) || !errors.Is(replayErr, apierror.ErrQuotaExhausted) {
+		t.Fatalf("replay error lost terminal quota classification: %v", replayErr)
+	}
+	var replayedProvider *apierror.ProviderError
+	if !errors.As(replayErr, &replayedProvider) {
+		t.Fatalf("replay error %T does not expose ProviderError", replayErr)
+	}
+	if replayedProvider.Provider != providerErr.Provider || replayedProvider.Code != providerErr.Code ||
+		replayedProvider.Status != providerErr.Status || replayedProvider.Message != providerErr.Message ||
+		replayedProvider.RequestID != providerErr.RequestID || replayedProvider.RetryAfter != providerErr.RetryAfter {
+		t.Fatalf("replayed provider error = %+v, want %+v", replayedProvider, providerErr)
 	}
 	if replayInner.calls != 0 {
 		t.Fatalf("replay called live provider %d times", replayInner.calls)
