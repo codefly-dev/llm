@@ -186,6 +186,7 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	var modelName string
 	var info ModelInfo
 	var transport *providerTransport
+	var key string
 	transportIdentity := TransportIdentityDirectProvider
 
 	// In replay-only mode the real provider is never called, so we can
@@ -226,7 +227,6 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 		if modelErr != nil {
 			return nil, modelErr
 		}
-		var key string
 		if b.transport != nil {
 			transportIdentity = b.transport.Identity
 			if replayOnly {
@@ -299,9 +299,7 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	if configurable, ok := inner.(RuntimeClockConfigurable); ok {
 		configurable.SetRuntimeClock(runtimeClock)
 	}
-	if transport != nil {
-		inner = redactTransportErrors(inner, transport.credential)
-	}
+	inner = protectProviderErrors(inner, key, transport)
 	var tracker *CostTracker
 	if b.costTracker != nil {
 		b.costTracker.SetModelInfo(info)
@@ -347,6 +345,22 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	mws = append(mws, RateLimitMiddlewareRPS(rps))
 
 	return Chain(inner, mws...), nil
+}
+
+// protectProviderErrors installs the same credential-redaction boundary for
+// direct providers and compatible gateway transports. Recorder, tracing, cost,
+// and retry middleware all observe errors outside this boundary, so leaving the
+// direct API key unbound here would let an echoed credential reach every
+// durable diagnostic sink.
+func protectProviderErrors(inner Client, directCredential string, transport *providerTransport) Client {
+	credential := directCredential
+	if transport != nil {
+		credential = transport.credential
+	}
+	if credential == "" {
+		return inner
+	}
+	return redactTransportErrors(inner, credential)
 }
 
 // resolveAPIKey returns a provider API key from, in order:
