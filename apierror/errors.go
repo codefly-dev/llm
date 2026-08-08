@@ -77,6 +77,15 @@ func IsRetryable(err error) bool {
 		errors.Is(err, ErrTimeout)
 }
 
+// IsProviderTerminal reports failures that make another request to the same
+// provider futile until operator-controlled credentials or billing state
+// changes. Request-specific failures such as a bad prompt, context overflow,
+// or a missing model are deliberately excluded: another model or request on
+// the same provider may still succeed.
+func IsProviderTerminal(err error) bool {
+	return errors.Is(err, ErrQuotaExhausted) || errors.Is(err, ErrUnauthorized)
+}
+
 func ClassifyStatus(status int) ErrorCode {
 	switch status {
 	case 408, 504:
