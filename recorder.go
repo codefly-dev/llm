@@ -174,7 +174,7 @@ func (m *recorderMW) CallWithOptions(ctx context.Context, prompt string, opts Re
 			return resp.Response, recordedError(resp)
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
-			return "", fmt.Errorf("recorder: replay call %s: %w", hash, replayErr)
+			return "", m.replayError("call", hash, replayErr)
 		}
 	}
 
@@ -222,7 +222,7 @@ func (m *recorderMW) StreamWithOptions(ctx context.Context, prompt string, opts 
 			return rec.Response, recordedError(rec)
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
-			return "", fmt.Errorf("recorder: replay stream %s: %w", hash, replayErr)
+			return "", m.replayError("stream", hash, replayErr)
 		}
 	}
 
@@ -275,7 +275,7 @@ func (m *recorderMW) CallCachedWithOptions(ctx context.Context, system, user str
 			return rec.Response, recordedError(rec)
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
-			return "", fmt.Errorf("recorder: replay cached call %s: %w", hash, replayErr)
+			return "", m.replayError("cached_call", hash, replayErr)
 		}
 	}
 
@@ -328,7 +328,7 @@ func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, me
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			m.dumpDebugKey("miss", hash, keyInput)
-			return Message{}, fmt.Errorf("recorder: replay tool call %s: %w", hash, replayErr)
+			return Message{}, m.replayError("tool_call", hash, replayErr)
 		}
 	}
 
@@ -394,7 +394,7 @@ func (m *recorderMW) StreamEvents(ctx context.Context, req StreamRequest) (<-cha
 			return out, nil
 		}
 		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
-			return nil, fmt.Errorf("recorder: replay event stream %s: %w", hash, replayErr)
+			return nil, m.replayError("event_stream", hash, replayErr)
 		}
 	}
 
@@ -748,10 +748,24 @@ func hashKey(model, prompt string) string {
 }
 
 func (m *recorderMW) recordingPath(name string) string {
+	return filepath.Join(m.recordingRoot(), name)
+}
+
+func (m *recorderMW) recordingRoot() string {
 	if m.runID == RecorderDefaultRunID {
-		return filepath.Join(m.dir, name)
+		return m.dir
 	}
-	return filepath.Join(m.dir, "runs", m.runID, name)
+	return filepath.Join(m.dir, "runs", m.runID)
+}
+
+func (m *recorderMW) replayError(operation, hash string, cause error) error {
+	if m.mode == RecordReplayOnly && errors.Is(cause, os.ErrNotExist) {
+		return &ReplayMissError{
+			Operation: operation, Hash: hash, Occurrence: 1,
+			Root: m.recordingRoot(), Cause: cause,
+		}
+	}
+	return fmt.Errorf("recorder: replay %s %s: %w", operation, hash, cause)
 }
 
 func canonicalRecorderRunID(runID string) (string, error) {

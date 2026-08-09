@@ -146,6 +146,18 @@ func (m *circuitBreakerMW) recordFailure() {
 	}
 }
 
+func (m *circuitBreakerMW) recordResult(err error) {
+	switch {
+	case err == nil:
+		m.recordSuccess()
+	case IsReplayMiss(err):
+		// A missing local certification artifact says nothing about provider
+		// health. Preserve the existing breaker state and failure count.
+	default:
+		m.recordFailure()
+	}
+}
+
 func (m *circuitBreakerMW) Call(ctx context.Context, prompt string) (string, error) {
 	return m.CallWithOptions(ctx, prompt, RequestOptions{})
 }
@@ -155,11 +167,7 @@ func (m *circuitBreakerMW) CallWithOptions(ctx context.Context, prompt string, o
 		return "", err
 	}
 	resp, err := CallWithOptions(ctx, m.next, prompt, opts)
-	if err != nil {
-		m.recordFailure()
-	} else {
-		m.recordSuccess()
-	}
+	m.recordResult(err)
 	return resp, err
 }
 
@@ -172,11 +180,7 @@ func (m *circuitBreakerMW) StreamWithOptions(ctx context.Context, prompt string,
 		return "", err
 	}
 	resp, err := StreamWithOptions(ctx, m.next, prompt, opts, onChunk)
-	if err != nil {
-		m.recordFailure()
-	} else {
-		m.recordSuccess()
-	}
+	m.recordResult(err)
 	return resp, err
 }
 
@@ -189,11 +193,7 @@ func (m *circuitBreakerMW) CallCachedWithOptions(ctx context.Context, system, us
 		return "", err
 	}
 	resp, err := CallCachedWithOptions(ctx, m.next, system, user, opts)
-	if err != nil {
-		m.recordFailure()
-	} else {
-		m.recordSuccess()
-	}
+	m.recordResult(err)
 	return resp, err
 }
 
@@ -206,11 +206,7 @@ func (m *circuitBreakerMW) CallWithToolsOptions(ctx context.Context, system stri
 		return Message{}, err
 	}
 	resp, err := CallWithToolsOptions(ctx, m.next, system, messages, tools, opts)
-	if err != nil {
-		m.recordFailure()
-	} else {
-		m.recordSuccess()
-	}
+	m.recordResult(err)
 	return resp, err
 }
 

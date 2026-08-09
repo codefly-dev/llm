@@ -276,6 +276,89 @@ func TestRecorder_ToolClientReplayOnlyMissing(t *testing.T) {
 	}
 }
 
+func TestRecorderReplayOnlyMissIdentifiesEveryNativeCallShape(t *testing.T) {
+	const model = "test-model"
+	messages := []Message{{Role: "user", Content: "inspect the project"}}
+	request := StreamRequest{Prompt: "stream events"}
+	toolKey, err := toolConversationKey("system", messages, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventKey, err := eventStreamKey(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		operation string
+		hash      string
+		invoke    func(context.Context, Client) error
+	}{
+		{
+			name: "call", operation: "call", hash: hashKey(model, "plain call"),
+			invoke: func(ctx context.Context, client Client) error {
+				_, err := client.Call(ctx, "plain call")
+				return err
+			},
+		},
+		{
+			name: "stream", operation: "stream", hash: hashKey(model, "plain stream"),
+			invoke: func(ctx context.Context, client Client) error {
+				_, err := client.Stream(ctx, "plain stream", nil)
+				return err
+			},
+		},
+		{
+			name: "cached call", operation: "cached_call", hash: hashKey(model, "system\n\nuser"),
+			invoke: func(ctx context.Context, client Client) error {
+				_, err := CallWithCaching(ctx, client, "system", "user")
+				return err
+			},
+		},
+		{
+			name: "tool call", operation: "tool_call", hash: hashKey(model, toolKey),
+			invoke: func(ctx context.Context, client Client) error {
+				toolClient, ok := AsToolClient(client)
+				if !ok {
+					return errors.New("recorder does not expose native tool calls")
+				}
+				_, err := toolClient.CallWithTools(ctx, "system", messages, nil)
+				return err
+			},
+		},
+		{
+			name: "event stream", operation: "event_stream", hash: hashKey(model, eventKey),
+			invoke: func(ctx context.Context, client Client) error {
+				eventClient, ok := AsEventStreamClient(client)
+				if !ok {
+					return errors.New("recorder does not expose event streaming")
+				}
+				_, err := eventClient.StreamEvents(ctx, request)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			client := RecorderMiddleware(dir, model, RecordReplayOnly)(&recorderInfraClient{})
+			err := test.invoke(t.Context(), client)
+			var miss *ReplayMissError
+			if !errors.As(err, &miss) {
+				t.Fatalf("error = %v, want typed ReplayMissError", err)
+			}
+			if miss.Operation != test.operation || miss.Hash != test.hash || miss.Occurrence != 1 || miss.Root != dir {
+				t.Fatalf("replay miss = %+v, want operation=%s hash=%s occurrence=1 root=%s", miss, test.operation, test.hash, dir)
+			}
+			if !IsReplayMiss(err) || !miss.IsExternalReplayMiss() || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replay miss lost classification or filesystem cause: %v", err)
+			}
+		})
+	}
+}
+
 func TestRecorder_OnMissReplaysHitsAndRecordsMisses(t *testing.T) {
 	dir := t.TempDir()
 	recordInner := &recorderInfraClient{response: Message{Content: "recorded"}}
@@ -319,8 +402,12 @@ func TestRecorder_OnMissRejectsCorruptExistingRecording(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner := &recorderInfraClient{response: Message{Content: "must not run"}}
-	if _, err := RecorderMiddleware(dir, "test-model", RecordOnMiss)(inner).Call(t.Context(), prompt); err == nil {
+	_, err := RecorderMiddleware(dir, "test-model", RecordOnMiss)(inner).Call(t.Context(), prompt)
+	if err == nil {
 		t.Fatal("heal accepted a corrupt existing recording")
+	}
+	if IsReplayMiss(err) {
+		t.Fatalf("corrupt recording classified as an absent replay artifact: %v", err)
 	}
 	if inner.calls != 0 {
 		t.Fatalf("live calls=%d, want 0 for corrupt recording", inner.calls)
