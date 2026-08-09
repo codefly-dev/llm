@@ -501,6 +501,21 @@ func TestCircuitBreaker_CallWithToolsNonToolClient(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not implement native tool calling")
 }
 
+func TestCircuitBreakerDoesNotCountRecorderReplayMiss(t *testing.T) {
+	recorder := RecorderMiddleware(t.TempDir(), "test-model", RecordReplayOnly)(&recorderInfraClient{})
+	client := CircuitBreakerMiddleware(CircuitBreakerConfig{FailureThreshold: 1}, clock.NewMock())(recorder)
+
+	for _, prompt := range []string{"first missing request", "second missing request"} {
+		_, err := client.Call(t.Context(), prompt)
+		if !IsReplayMiss(err) {
+			t.Fatalf("call error = %v, want replay miss", err)
+		}
+		if got := cbState(client); got != CircuitClosed {
+			t.Fatalf("breaker state after replay miss = %s, want closed", got)
+		}
+	}
+}
+
 // plainClient implements only Client (no CallWithTools).
 type plainClient struct {
 	response string
