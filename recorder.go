@@ -153,6 +153,7 @@ func (m *recorderMW) Call(ctx context.Context, prompt string) (string, error) {
 }
 
 func (m *recorderMW) CallWithOptions(ctx context.Context, prompt string, opts RequestOptions) (string, error) {
+	m.setLastUsage(nil)
 	if m.configErr != nil {
 		return "", fmt.Errorf("recorder: invalid configuration: %w", m.configErr)
 	}
@@ -197,6 +198,7 @@ func (m *recorderMW) Stream(ctx context.Context, prompt string, onChunk func(tex
 }
 
 func (m *recorderMW) StreamWithOptions(ctx context.Context, prompt string, opts RequestOptions, onChunk func(text string) error) (string, error) {
+	m.setLastUsage(nil)
 	if m.configErr != nil {
 		return "", fmt.Errorf("recorder: invalid configuration: %w", m.configErr)
 	}
@@ -255,6 +257,7 @@ func (m *recorderMW) CallCached(ctx context.Context, system, user string) (strin
 }
 
 func (m *recorderMW) CallCachedWithOptions(ctx context.Context, system, user string, opts RequestOptions) (string, error) {
+	m.setLastUsage(nil)
 	if m.configErr != nil {
 		return "", fmt.Errorf("recorder: invalid configuration: %w", m.configErr)
 	}
@@ -299,6 +302,7 @@ func (m *recorderMW) CallWithTools(ctx context.Context, system string, messages 
 }
 
 func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, messages []Message, tools []ToolDef, opts RequestOptions) (Message, error) {
+	m.setLastUsage(nil)
 	if m.configErr != nil {
 		return Message{}, fmt.Errorf("recorder: invalid configuration: %w", m.configErr)
 	}
@@ -366,6 +370,7 @@ func (m *recorderMW) dumpDebugKey(phase, hash, keyInput string) {
 // StreamEvents records and replays normalized event streams. The recording key
 // includes the full tool descriptors so cassette replay notices schema changes.
 func (m *recorderMW) StreamEvents(ctx context.Context, req StreamRequest) (<-chan StreamEvent, error) {
+	m.setLastUsage(nil)
 	if m.configErr != nil {
 		return nil, fmt.Errorf("recorder: invalid configuration: %w", m.configErr)
 	}

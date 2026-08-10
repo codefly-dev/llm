@@ -359,6 +359,71 @@ func TestRecorderReplayOnlyMissIdentifiesEveryNativeCallShape(t *testing.T) {
 	}
 }
 
+func TestRecorderReplayMissClearsPriorCallUsage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		invoke func(*recorderMW) error
+	}{
+		{
+			name: "call",
+			invoke: func(recorder *recorderMW) error {
+				_, err := recorder.Call(t.Context(), "missing call")
+				return err
+			},
+		},
+		{
+			name: "stream",
+			invoke: func(recorder *recorderMW) error {
+				_, err := recorder.Stream(t.Context(), "missing stream", nil)
+				return err
+			},
+		},
+		{
+			name: "cached call",
+			invoke: func(recorder *recorderMW) error {
+				_, err := recorder.CallCached(t.Context(), "system", "missing cached call")
+				return err
+			},
+		},
+		{
+			name: "tool call",
+			invoke: func(recorder *recorderMW) error {
+				_, err := recorder.CallWithTools(t.Context(), "system", []Message{{Role: "user", Content: "missing tool call"}}, nil)
+				return err
+			},
+		},
+		{
+			name: "event stream",
+			invoke: func(recorder *recorderMW) error {
+				_, err := recorder.StreamEvents(t.Context(), StreamRequest{System: "missing event stream"})
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := &recorderMW{
+				dir:       t.TempDir(),
+				model:     "test-model",
+				mode:      RecordReplayOnly,
+				runID:     RecorderDefaultRunID,
+				clock:     clock.New(),
+				lastUsage: &Usage{InputTokens: 10, OutputTokens: 5, CostUSD: 0.25},
+			}
+			err := test.invoke(recorder)
+			if !IsReplayMiss(err) {
+				t.Fatalf("error = %v, want replay miss", err)
+			}
+			if usage := recorder.LastCallUsage(); usage != nil {
+				t.Fatalf("usage = %+v, want nil after a call that never reached a provider or cassette", usage)
+			}
+		})
+	}
+}
+
 func TestRecorder_OnMissReplaysHitsAndRecordsMisses(t *testing.T) {
 	dir := t.TempDir()
 	recordInner := &recorderInfraClient{response: Message{Content: "recorded"}}
