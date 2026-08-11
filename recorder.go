@@ -170,24 +170,31 @@ func (m *recorderMW) CallWithOptions(ctx context.Context, prompt string, opts Re
 	hash := hashKey(m.model, keyInput)
 	path := m.recordingPath(hash + ".json")
 	span := oteltrace.SpanFromContext(ctx)
+	healClaimed := false
 
 	// Try replay.
 	if m.mode != RecordAlways {
 		resp, replayErr := m.replay(path, hash, recordingText)
 		if replayErr == nil {
-			span.SetAttributes(attribute.String("llm.recorder", "replay"))
-			m.dumpDebugKey("replay", hash, keyInput)
-			m.setLastUsage(resp.Usage)
-			return resp.Response, recordedError(resp)
-		}
-		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
+			if m.shouldReplay(resp) {
+				span.SetAttributes(attribute.String("llm.recorder", "replay"))
+				m.dumpDebugKey("replay", hash, keyInput)
+				m.setLastUsage(resp.Usage)
+				return resp.Response, recordedError(resp)
+			}
+			span.SetAttributes(attribute.String("llm.recorder", "heal-recorded-failure"))
+			m.dumpDebugKey("heal", hash, keyInput)
+			healClaimed = true
+		} else if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return "", m.replayError("call", hash, replayErr)
 		}
 	}
 
 	// Call the real provider.
-	if err := m.claim(path); err != nil {
-		return "", err
+	if !healClaimed {
+		if err := m.claim(path); err != nil {
+			return "", err
+		}
 	}
 	m.liveMu.Lock()
 	defer m.liveMu.Unlock()
@@ -215,27 +222,34 @@ func (m *recorderMW) StreamWithOptions(ctx context.Context, prompt string, opts 
 	hash := hashKey(m.model, keyInput)
 	path := m.recordingPath(hash + ".json")
 	span := oteltrace.SpanFromContext(ctx)
+	healClaimed := false
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingText)
 		if replayErr == nil {
-			span.SetAttributes(attribute.String("llm.recorder", "replay"))
-			m.dumpDebugKey("replay", hash, keyInput)
-			m.setLastUsage(rec.Usage)
-			if onChunk != nil && rec.Response != "" {
-				if callbackErr := onChunk(rec.Response); callbackErr != nil {
-					return rec.Response, callbackErr
+			if m.shouldReplay(rec) {
+				span.SetAttributes(attribute.String("llm.recorder", "replay"))
+				m.dumpDebugKey("replay", hash, keyInput)
+				m.setLastUsage(rec.Usage)
+				if onChunk != nil && rec.Response != "" {
+					if callbackErr := onChunk(rec.Response); callbackErr != nil {
+						return rec.Response, callbackErr
+					}
 				}
+				return rec.Response, recordedError(rec)
 			}
-			return rec.Response, recordedError(rec)
-		}
-		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
+			span.SetAttributes(attribute.String("llm.recorder", "heal-recorded-failure"))
+			m.dumpDebugKey("heal", hash, keyInput)
+			healClaimed = true
+		} else if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return "", m.replayError("stream", hash, replayErr)
 		}
 	}
 
-	if err := m.claim(path); err != nil {
-		return "", err
+	if !healClaimed {
+		if err := m.claim(path); err != nil {
+			return "", err
+		}
 	}
 	m.liveMu.Lock()
 	defer m.liveMu.Unlock()
@@ -275,21 +289,27 @@ func (m *recorderMW) CallCachedWithOptions(ctx context.Context, system, user str
 	hash := hashKey(m.model, keyInput)
 	path := m.recordingPath(hash + ".json")
 	span := oteltrace.SpanFromContext(ctx)
+	healClaimed := false
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingText)
 		if replayErr == nil {
-			span.SetAttributes(attribute.String("llm.recorder", "replay"))
-			m.setLastUsage(rec.Usage)
-			return rec.Response, recordedError(rec)
-		}
-		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
+			if m.shouldReplay(rec) {
+				span.SetAttributes(attribute.String("llm.recorder", "replay"))
+				m.setLastUsage(rec.Usage)
+				return rec.Response, recordedError(rec)
+			}
+			span.SetAttributes(attribute.String("llm.recorder", "heal-recorded-failure"))
+			healClaimed = true
+		} else if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			return "", m.replayError("cached_call", hash, replayErr)
 		}
 	}
 
-	if err := m.claim(path); err != nil {
-		return "", err
+	if !healClaimed {
+		if err := m.claim(path); err != nil {
+			return "", err
+		}
 	}
 	m.liveMu.Lock()
 	defer m.liveMu.Unlock()
@@ -323,27 +343,34 @@ func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, me
 	hash := hashKey(m.model, keyInput)
 	path := m.recordingPath("tools_" + hash + ".json")
 	span := oteltrace.SpanFromContext(ctx)
+	healClaimed := false
 
 	if m.mode != RecordAlways {
 		rec, replayErr := m.replay(path, hash, recordingTool)
 		if replayErr == nil {
-			var msg Message
-			if err := json.Unmarshal(rec.ToolResponse, &msg); err != nil {
-				return Message{}, fmt.Errorf("recorder: decode tool response %s: %w", hash, err)
+			if m.shouldReplay(rec) {
+				var msg Message
+				if err := json.Unmarshal(rec.ToolResponse, &msg); err != nil {
+					return Message{}, fmt.Errorf("recorder: decode tool response %s: %w", hash, err)
+				}
+				span.SetAttributes(attribute.String("llm.recorder", "replay"))
+				m.dumpDebugKey("replay", hash, keyInput)
+				m.setLastUsage(rec.Usage)
+				return msg, recordedError(rec)
 			}
-			span.SetAttributes(attribute.String("llm.recorder", "replay"))
-			m.dumpDebugKey("replay", hash, keyInput)
-			m.setLastUsage(rec.Usage)
-			return msg, recordedError(rec)
-		}
-		if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
+			span.SetAttributes(attribute.String("llm.recorder", "heal-recorded-failure"))
+			m.dumpDebugKey("heal", hash, keyInput)
+			healClaimed = true
+		} else if m.mode == RecordReplayOnly || !errors.Is(replayErr, os.ErrNotExist) {
 			m.dumpDebugKey("miss", hash, keyInput)
 			return Message{}, m.replayError("tool_call", hash, replayErr)
 		}
 	}
 
-	if err := m.claim(path); err != nil {
-		return Message{}, err
+	if !healClaimed {
+		if err := m.claim(path); err != nil {
+			return Message{}, err
+		}
 	}
 	m.liveMu.Lock()
 	defer m.liveMu.Unlock()
@@ -741,6 +768,14 @@ func recordedError(rec recording) error {
 			RetryAfter: time.Duration(provider.RetryAfterNS),
 		},
 	}
+}
+
+// shouldReplay keeps replay-only deterministic while making explicit healing
+// recover from external failures. A recorded provider error is evidence for a
+// replay test, but it is not a permanent cache hit when an operator asked to
+// heal against the live provider.
+func (m *recorderMW) shouldReplay(rec recording) bool {
+	return m.mode != RecordOnMiss || rec.Error == nil
 }
 
 func captureRecordedFailure(err error) *recordedFailure {

@@ -495,6 +495,37 @@ func TestRecorder_OnMissReplaysHitsAndRecordsMisses(t *testing.T) {
 	}
 }
 
+func TestRecorder_OnMissRefreshesRecordedProviderFailure(t *testing.T) {
+	dir := t.TempDir()
+	providerErr := &apierror.ProviderError{
+		Provider: "openai", Code: apierror.CodeQuotaExhausted, Status: 429, Message: "credits exhausted",
+	}
+	recordFailure := RecorderMiddleware(dir, "test-model", RecordAlways)(&recorderInfraClient{err: providerErr})
+	if _, err := recordFailure.(*recorderMW).CallWithTools(t.Context(), "system", nil, nil); !errors.Is(err, apierror.ErrQuotaExhausted) {
+		t.Fatalf("record error = %v, want quota exhausted", err)
+	}
+
+	healInner := &recorderInfraClient{response: Message{Role: "assistant", Content: "recovered"}}
+	heal := RecorderMiddleware(dir, "test-model", RecordOnMiss)(healInner)
+	response, err := heal.(*recorderMW).CallWithTools(t.Context(), "system", nil, nil)
+	if err != nil || response.Content != "recovered" {
+		t.Fatalf("heal response = %+v, %v", response, err)
+	}
+	if healInner.calls != 1 {
+		t.Fatalf("live calls = %d, want one refresh of recorded failure", healInner.calls)
+	}
+
+	replayInner := &recorderInfraClient{response: Message{Content: "must not run"}}
+	replayed := RecorderMiddleware(dir, "test-model", RecordReplayOnly)(replayInner)
+	response, err = replayed.(*recorderMW).CallWithTools(t.Context(), "system", nil, nil)
+	if err != nil || response.Content != "recovered" {
+		t.Fatalf("replayed healed response = %+v, %v", response, err)
+	}
+	if replayInner.calls != 0 {
+		t.Fatalf("replay called live provider %d times", replayInner.calls)
+	}
+}
+
 func TestRecorder_OnMissRejectsCorruptExistingRecording(t *testing.T) {
 	dir := t.TempDir()
 	prompt := "corrupt"
