@@ -79,7 +79,10 @@ func RecorderMiddleware(dir string, model string, mode RecordMode) Middleware {
 // injectable so recording metadata is byte-stable under replay/fixture tests;
 // nil selects a real clock for live recording.
 type RecorderConfig struct {
-	Dir               string
+	Dir string
+	// DebugDir is an explicit, non-cassette artifact root for opt-in key
+	// diagnostics. An empty directory disables diagnostic file writes.
+	DebugDir          string
 	Model             string
 	TransportIdentity TransportIdentity
 	Mode              RecordMode
@@ -99,6 +102,9 @@ func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
 	if strings.TrimSpace(cfg.Model) == "" {
 		configErr = errors.Join(configErr, fmt.Errorf("recorder model is empty"))
 	}
+	if cfg.DebugDir != "" {
+		configErr = errors.Join(configErr, validateRecorderDebugDir(cfg.Dir, cfg.DebugDir))
+	}
 	if cfg.Mode != RecordReplayOnly && cfg.Mode != RecordAlways && cfg.Mode != RecordOnMiss {
 		configErr = errors.Join(configErr, fmt.Errorf("invalid recorder mode %d", cfg.Mode))
 	}
@@ -106,6 +112,7 @@ func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
 		return &recorderMW{
 			next:              next,
 			dir:               cfg.Dir,
+			debugDir:          cfg.DebugDir,
 			model:             cfg.Model,
 			transportIdentity: cfg.TransportIdentity,
 			mode:              cfg.Mode,
@@ -128,6 +135,7 @@ func RecorderMiddlewareWithRunID(dir string, model string, mode RecordMode, runI
 type recorderMW struct {
 	next              Client
 	dir               string
+	debugDir          string
 	model             string
 	transportIdentity TransportIdentity
 	mode              RecordMode
@@ -351,20 +359,48 @@ func (m *recorderMW) CallWithToolsOptions(ctx context.Context, system string, me
 	return resp, callErr
 }
 
-// dumpDebugKey writes the recorder's key input next to the cassette
-// dir for byte-diffing record vs replay divergence. Gated by
+// dumpDebugKey writes the recorder's key input to an explicit diagnostic
+// artifact directory for byte-diffing record vs replay divergence. Gated by
 // MIND_RECORDER_DEBUG=1; pairs "_miss_<hash>.key.txt" (replay branch)
 // with "_record_<hash>.key.txt" or "_replay_<hash>.key.txt" so a single
-// `diff` reveals exactly which turn drifted. Test-suite-only diagnostic;
-// silently no-ops outside debug mode.
+// `diff` reveals exactly which turn drifted. It never writes beneath the
+// cassette root and silently no-ops without an explicit artifact directory.
 func (m *recorderMW) dumpDebugKey(phase, hash, keyInput string) {
-	if !recorderDebugEnabled() {
+	if !recorderDebugEnabled() || strings.TrimSpace(m.debugDir) == "" {
 		return
 	}
-	dumpPath := m.recordingPath("_" + phase + "_" + hash + ".key.txt")
+	dumpRoot := m.debugDir
+	if m.runID != "" && m.runID != RecorderDefaultRunID {
+		dumpRoot = filepath.Join(dumpRoot, "runs", m.runID)
+	}
+	if err := os.MkdirAll(dumpRoot, 0o755); err != nil {
+		return
+	}
+	dumpPath := filepath.Join(dumpRoot, "_"+phase+"_"+hash+".key.txt")
 	if err := os.WriteFile(dumpPath, []byte(keyInput), 0o644); err == nil && phase == "miss" {
 		wool.Get(context.Background()).In("llm.recorder").Warn("recorder miss: dumped key input", wool.Field("hash", hash), wool.Field("path", dumpPath))
 	}
+}
+
+// validateRecorderDebugDir enforces the write-boundary invariant that recorder
+// diagnostics cannot be placed in the immutable cassette tree.
+func validateRecorderDebugDir(cassetteDir, debugDir string) error {
+	cassetteRoot, err := filepath.Abs(filepath.Clean(cassetteDir))
+	if err != nil {
+		return fmt.Errorf("resolve recorder directory: %w", err)
+	}
+	debugRoot, err := filepath.Abs(filepath.Clean(debugDir))
+	if err != nil {
+		return fmt.Errorf("resolve recorder debug directory: %w", err)
+	}
+	relative, err := filepath.Rel(cassetteRoot, debugRoot)
+	if err != nil {
+		return fmt.Errorf("compare recorder directories: %w", err)
+	}
+	if relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+		return fmt.Errorf("recorder debug directory must be outside cassette directory")
+	}
+	return nil
 }
 
 // StreamEvents records and replays normalized event streams. The recording key
