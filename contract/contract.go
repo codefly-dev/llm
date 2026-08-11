@@ -418,9 +418,11 @@ type RecordMode int
 const (
 	RecordReplayOnly RecordMode = iota
 	RecordAlways
-	// RecordOnMiss replays certified calls when present and invokes the real
-	// provider only for absent recordings. It exists for explicit cassette
-	// healing; CI remains fail-closed on RecordReplayOnly.
+	// RecordOnMiss replays successful certified calls when present and invokes
+	// the real provider for absent recordings or recorded failures. It exists
+	// for explicit cassette healing: a provider outage or exhausted quota must
+	// not remain immortal after the external condition recovers. CI remains
+	// fail-closed on RecordReplayOnly, which reproduces recorded failures.
 	RecordOnMiss
 )
 
