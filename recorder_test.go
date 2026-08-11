@@ -102,6 +102,42 @@ func TestRecording_ShortPromptPreviewNotTruncated(t *testing.T) {
 	}
 }
 
+func TestRecorderDebugWritesOutsideCassetteTree(t *testing.T) {
+	t.Setenv("MIND_RECORDER_DEBUG", "1")
+	cassetteDir := t.TempDir()
+	debugDir := t.TempDir()
+	recorder := &recorderMW{
+		dir:      cassetteDir,
+		debugDir: debugDir,
+		runID:    RecorderDefaultRunID,
+	}
+
+	recorder.dumpDebugKey("replay", "abc123", "semantic key input")
+
+	entries, err := os.ReadDir(cassetteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("debug replay mutated cassette tree: %v", entries)
+	}
+	data, err := os.ReadFile(filepath.Join(debugDir, "_replay_abc123.key.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "semantic key input" {
+		t.Fatalf("debug key input = %q", data)
+	}
+}
+
+func TestRecorderRejectsDebugDirInsideCassetteTree(t *testing.T) {
+	cassetteDir := t.TempDir()
+	err := validateRecorderDebugDir(cassetteDir, filepath.Join(cassetteDir, "debug"))
+	if err == nil || !strings.Contains(err.Error(), "debug directory must be outside cassette directory") {
+		t.Fatalf("invalid debug directory error = %v", err)
+	}
+}
+
 // recorderInfraClient exists only to exercise recorder persistence and error
 // propagation. Semantic model behavior is covered by real-provider cassettes.
 type recorderInfraClient struct {

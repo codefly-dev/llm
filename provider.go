@@ -25,12 +25,13 @@ type clientBuilder struct {
 	retryMax int
 	retryBO  time.Duration
 
-	recorder      bool
-	recorderDir   string
-	recorderRunID string
-	recorderClock clock.Clock
-	runtimeClock  clock.Clock
-	recordMode    RecordMode
+	recorder         bool
+	recorderDir      string
+	recorderDebugDir string
+	recorderRunID    string
+	recorderClock    clock.Clock
+	runtimeClock     clock.Clock
+	recordMode       RecordMode
 
 	costTracker    *CostTracker
 	rateLimit      float64
@@ -58,6 +59,15 @@ func WithRecorder(dir string, mode RecordMode) ClientOption {
 		b.recorder = true
 		b.recorderDir = dir
 		b.recordMode = mode
+	}
+}
+
+// WithRecorderDebugDir selects an artifact directory for opt-in recorder key
+// diagnostics. It must be separate from the cassette directory: replay must
+// never mutate committed cassette state, even when MIND_RECORDER_DEBUG=1.
+func WithRecorderDebugDir(dir string) ClientOption {
+	return func(b *clientBuilder) {
+		b.recorderDebugDir = dir
 	}
 }
 
@@ -281,6 +291,7 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	if b.recorder {
 		mws = append(mws, RecorderMiddlewareWithConfig(RecorderConfig{
 			Dir:               b.recorderDir,
+			DebugDir:          b.recorderDebugDir,
 			Model:             fullModelName,
 			TransportIdentity: transportIdentity,
 			Mode:              b.recordMode,
