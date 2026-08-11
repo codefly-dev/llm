@@ -1,13 +1,11 @@
 package llm
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -550,18 +548,9 @@ func (m *recorderMW) setLastUsage(usage *Usage) {
 }
 
 func (m *recorderMW) replay(path, hash string, kind recordingKind) (recording, error) {
-	data, err := os.ReadFile(path)
+	rec, err := readRecording(path)
 	if err != nil {
-		return recording{}, fmt.Errorf("read %s: %w", path, err)
-	}
-	var rec recording
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&rec); err != nil {
-		return recording{}, fmt.Errorf("decode %s: %w", path, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return recording{}, fmt.Errorf("decode %s: trailing JSON content", path)
+		return recording{}, err
 	}
 	if err := m.validateRecording(rec, hash, kind); err != nil {
 		return recording{}, fmt.Errorf("validate %s: %w", path, err)
@@ -682,8 +671,12 @@ func (m *recorderMW) validateRecording(rec recording, hash string, kind recordin
 	if rec.TransportIdentity != "" && rec.TransportIdentity != m.transportIdentity {
 		return fmt.Errorf("transport_identity = %q, want %q", rec.TransportIdentity, m.transportIdentity)
 	}
-	if rec.RunID != m.runID {
-		return fmt.Errorf("run_id = %q, want %q", rec.RunID, m.runID)
+	return validateRecordingForRun(rec, hash, kind, m.runID)
+}
+
+func validateRecordingForRun(rec recording, hash string, kind recordingKind, runID string) error {
+	if rec.RunID != runID {
+		return fmt.Errorf("run_id = %q, want %q", rec.RunID, runID)
 	}
 	if rec.PromptHash != hash {
 		return fmt.Errorf("prompt_hash = %q, want %q", rec.PromptHash, hash)
