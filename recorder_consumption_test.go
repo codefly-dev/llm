@@ -53,6 +53,26 @@ func TestVerifyRecorderConsumedScopesNamedRuns(t *testing.T) {
 	}
 }
 
+func TestVerifyRecorderConsumedAggregatesModelRouterClients(t *testing.T) {
+	dir := t.TempDir()
+	cheapModel := "openai/gpt-cheap"
+	strongModel := "openai/gpt-strong"
+	persistRecorderTestEntry(t, dir, cheapModel, RecorderDefaultRunID, "classify")
+	persistRecorderTestEntry(t, dir, strongModel, RecorderDefaultRunID, "execute")
+
+	cheap := RecorderMiddleware(dir, cheapModel, RecordReplayOnly)(nil)
+	strong := RecorderMiddleware(dir, strongModel, RecordReplayOnly)(nil)
+	if _, err := cheap.Call(t.Context(), "classify"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := strong.Call(t.Context(), "execute"); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyRecorderConsumed(cheap, strong); err != nil {
+		t.Fatalf("router-wide cassette verification failed: %v", err)
+	}
+}
+
 // persistRecorderTestEntry exercises the production recorder's atomic JSON
 // writer against a real filesystem. Model behavior is outside this test: the
 // persisted response exists only to validate cassette ownership and lifecycle.

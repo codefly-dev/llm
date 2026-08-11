@@ -3,8 +3,9 @@ package llm
 // ARCHITECTURE: a cassette is qualification evidence, not a best-effort cache.
 // Request lookup proves that every call made by the current workflow was
 // recorded; this file proves the inverse, that every recording owned by the
-// selected run was exercised. Together those checks make workflow drift fail
-// closed without coupling callers to the recorder's concrete middleware type.
+// selected run was exercised. A model router may create several recorder
+// clients over one directory, so verification aggregates their claims before
+// judging that shared namespace.
 
 import (
 	"bytes"
@@ -20,64 +21,83 @@ import (
 	"strings"
 )
 
-// RecorderConsumptionVerifier is implemented by the recorder middleware in a
-// Client chain. Callers normally use VerifyRecorderConsumed so outer tracing,
-// cost, or policy middleware remains transparent.
-type RecorderConsumptionVerifier interface {
-	VerifyRecorderConsumed() error
-}
-
-// VerifyRecorderConsumed finds every recorder in a Client middleware chain and
-// proves that replay consumed its exact recording set. Asking a chain without
-// a recorder to verify fails closed: otherwise a wiring regression could turn
-// a qualification check into a silent no-op.
-func VerifyRecorderConsumed(client Client) error {
-	found := false
-	var result error
-	for current := client; current != nil; {
-		if verifier, ok := current.(RecorderConsumptionVerifier); ok {
-			found = true
-			result = errors.Join(result, verifier.VerifyRecorderConsumed())
-		}
-		unwrapper, ok := current.(interface{ Unwrap() Client })
-		if !ok {
-			break
-		}
-		current = unwrapper.Unwrap()
+// VerifyRecorderConsumed finds the recorders in one or more Client middleware
+// chains and proves replay consumed each selected cassette namespace exactly.
+// Multiple clients are required when model routing shares one cassette
+// directory. Asking clients without a recorder to verify fails closed so a
+// wiring regression cannot turn qualification into a silent no-op.
+func VerifyRecorderConsumed(clients ...Client) error {
+	recorders := recorderMiddlewareSet(clients)
+	if len(recorders) == 0 {
+		return errors.New("llm recorder: consumption verification requested without recorder middleware")
 	}
-	if !found {
-		return errors.New("llm recorder: consumption verification requested for a client without recorder middleware")
+	groups := make(map[string][]*recorderMW)
+	for _, recorder := range recorders {
+		groups[recorder.recordingRoot()] = append(groups[recorder.recordingRoot()], recorder)
+	}
+	roots := make([]string, 0, len(groups))
+	for root := range groups {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	var result error
+	for _, root := range roots {
+		result = errors.Join(result, verifyRecorderGroup(root, groups[root]))
 	}
 	return result
 }
 
-// VerifyRecorderConsumed checks one recorder's selected run namespace. Record
-// mode deliberately has no replay-consumption contract. Replay and on-miss
-// modes reject stale, malformed, misnamed, or otherwise unowned objects.
-func (m *recorderMW) VerifyRecorderConsumed() error {
-	if m == nil {
-		return errors.New("llm recorder: nil recorder middleware")
+func recorderMiddlewareSet(clients []Client) []*recorderMW {
+	seen := make(map[*recorderMW]struct{})
+	var recorders []*recorderMW
+	for _, client := range clients {
+		for current := client; current != nil; {
+			if recorder, ok := current.(*recorderMW); ok {
+				if _, exists := seen[recorder]; !exists {
+					seen[recorder] = struct{}{}
+					recorders = append(recorders, recorder)
+				}
+			}
+			unwrapper, ok := current.(interface{ Unwrap() Client })
+			if !ok {
+				break
+			}
+			current = unwrapper.Unwrap()
+		}
 	}
-	if m.configErr != nil {
-		return fmt.Errorf("llm recorder: invalid configuration: %w", m.configErr)
+	return recorders
+}
+
+func verifyRecorderGroup(root string, recorders []*recorderMW) error {
+	mode := recorders[0].mode
+	runID := recorders[0].runID
+	for _, recorder := range recorders {
+		if recorder.configErr != nil {
+			return fmt.Errorf("llm recorder: invalid configuration: %w", recorder.configErr)
+		}
+		if recorder.mode != mode || recorder.runID != runID {
+			return fmt.Errorf("llm recorder: inconsistent recorder configuration for shared root %s", root)
+		}
 	}
-	if m.mode == RecordAlways {
+	if mode == RecordAlways {
 		return nil
 	}
 
-	// A live on-miss call may still be committing its recording. Serialize the
-	// inventory snapshot with writes, then copy the claimed paths under their
-	// own lock. Callers invoke this after the workflow has joined all calls.
-	m.writeMu.Lock()
-	defer m.writeMu.Unlock()
-	m.seenMu.Lock()
-	consumed := make(map[string]struct{}, len(m.seen))
-	for path := range m.seen {
-		consumed[path] = struct{}{}
+	// Verification is an end-of-run operation after the caller has joined all
+	// requests. Each snapshot still takes the recorder's normal locks so race
+	// instrumentation and accidental overlap remain safe without introducing a
+	// cross-recorder lock order.
+	consumed := make(map[string]struct{})
+	for _, recorder := range recorders {
+		recorder.writeMu.Lock()
+		recorder.seenMu.Lock()
+		for path := range recorder.seen {
+			consumed[path] = struct{}{}
+		}
+		recorder.seenMu.Unlock()
+		recorder.writeMu.Unlock()
 	}
-	m.seenMu.Unlock()
 
-	root := m.recordingRoot()
 	entries, err := os.ReadDir(root)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("llm recorder: list replay recordings in %s: %w", root, err)
@@ -88,7 +108,7 @@ func (m *recorderMW) VerifyRecorderConsumed() error {
 		if entry.IsDir() {
 			// Named runs are independent cassette samples. The default run owns
 			// only flat files and must not consume its sibling run namespaces.
-			if m.runID == RecorderDefaultRunID && entry.Name() == "runs" {
+			if runID == RecorderDefaultRunID && entry.Name() == "runs" {
 				continue
 			}
 			return fmt.Errorf("llm recorder: unowned entry object %s", path)
@@ -101,7 +121,10 @@ func (m *recorderMW) VerifyRecorderConsumed() error {
 		if err != nil {
 			return fmt.Errorf("llm recorder: inspect replay recording %s: %w", path, err)
 		}
-		if err := m.validateRecording(rec, hash, kind); err != nil {
+		if err := validateRecordingForRun(rec, hash, kind, runID); err != nil {
+			return fmt.Errorf("llm recorder: invalid content-addressed recording %s: %w", path, err)
+		}
+		if err := validateRecordingTransport(rec, recorders); err != nil {
 			return fmt.Errorf("llm recorder: invalid content-addressed recording %s: %w", path, err)
 		}
 		expected[path] = struct{}{}
@@ -128,6 +151,26 @@ func (m *recorderMW) VerifyRecorderConsumed() error {
 				filepath.Base(path), boolCount(wasConsumed), boolCount(wasRecorded),
 			)
 		}
+	}
+	return nil
+}
+
+// validateRecordingTransport checks a known current model against every
+// recorder that may serve it. A recording for a removed model remains valid
+// stale evidence and is reported by the consumption mismatch below.
+func validateRecordingTransport(rec recording, recorders []*recorderMW) error {
+	modelKnown := false
+	for _, recorder := range recorders {
+		if recorder.model != rec.Model {
+			continue
+		}
+		modelKnown = true
+		if rec.TransportIdentity == "" || rec.TransportIdentity == recorder.transportIdentity {
+			return nil
+		}
+	}
+	if modelKnown {
+		return fmt.Errorf("transport_identity %q does not match the current recorder", rec.TransportIdentity)
 	}
 	return nil
 }

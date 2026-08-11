@@ -671,8 +671,12 @@ func (m *recorderMW) validateRecording(rec recording, hash string, kind recordin
 	if rec.TransportIdentity != "" && rec.TransportIdentity != m.transportIdentity {
 		return fmt.Errorf("transport_identity = %q, want %q", rec.TransportIdentity, m.transportIdentity)
 	}
-	if rec.RunID != m.runID {
-		return fmt.Errorf("run_id = %q, want %q", rec.RunID, m.runID)
+	return validateRecordingForRun(rec, hash, kind, m.runID)
+}
+
+func validateRecordingForRun(rec recording, hash string, kind recordingKind, runID string) error {
+	if rec.RunID != runID {
+		return fmt.Errorf("run_id = %q, want %q", rec.RunID, runID)
 	}
 	if rec.PromptHash != hash {
 		return fmt.Errorf("prompt_hash = %q, want %q", rec.PromptHash, hash)
