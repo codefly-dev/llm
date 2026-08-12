@@ -91,10 +91,12 @@ func toOpenAIResponseTools(tools []ToolDef) []responses.ToolUnionParam {
 			Name:        tool.Name,
 			Description: param.NewOpt(tool.Description),
 			Parameters:  toolInputSchema(tool),
-			// Mind validates the exact schema locally on both live and replayed
-			// responses. Strict=false avoids provider-specific restrictions on
-			// otherwise valid JSON Schema constructs such as optional fields.
-			Strict: param.NewOpt(false),
+			// BOUNDARY: StrictInput is part of the caller's typed tool contract.
+			// OpenAI rejects incompatible strict schemas at request admission;
+			// silently weakening the flag turns required arguments into best-effort
+			// output and forces the orchestrator to spend another model turn repairing
+			// malformed tool arguments.
+			Strict: param.NewOpt(tool.StrictInput),
 		}})
 	}
 	return out

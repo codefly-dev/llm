@@ -96,6 +96,26 @@ func TestToOpenAIResponseTools_PreservesFullInputSchema(t *testing.T) {
 	}
 }
 
+func TestToOpenAIResponseTools_PreservesStrictInputContract(t *testing.T) {
+	tools := []ToolDef{
+		{Name: "read", Description: "read a file"},
+		{Name: "final_response", Description: "finish", InputSchema: map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{"answer": map[string]any{"type": "string"}},
+			"required":             []string{"answer"},
+			"additionalProperties": false,
+		}, StrictInput: true},
+	}
+
+	result := toOpenAIResponseTools(tools)
+	if result[0].OfFunction.Strict.Value {
+		t.Fatalf("ordinary tool strict = %v, want false", result[0].OfFunction.Strict)
+	}
+	if !result[1].OfFunction.Strict.Value {
+		t.Fatalf("final_response strict = %v, want true", result[1].OfFunction.Strict)
+	}
+}
+
 func TestValidateToolDefsRejectsNonCanonicalTypes(t *testing.T) {
 	for _, alias := range []string{"str", "int", "float", "double", "bool", "list", "json", "map"} {
 		t.Run(alias, func(t *testing.T) {
