@@ -47,6 +47,37 @@ func VerifyRecorderConsumed(clients ...Client) error {
 	return result
 }
 
+// PruneRecorderUnconsumed removes recordings that a successfully healed
+// workflow no longer calls. It is deliberately restricted to RecordOnMiss:
+// replay is immutable evidence, while record mode creates a complete new
+// generation and has no prior entries to reconcile.
+//
+// Callers must invoke this only after the workflow has completed and all
+// concurrent requests have joined, then call VerifyRecorderConsumed before
+// promoting the healed generation. New prompt hashes and obsolete prompt
+// hashes are both normal consequences of changing a prompt or trajectory; the
+// resulting cassette must contain the exact current request set.
+func PruneRecorderUnconsumed(clients ...Client) error {
+	recorders := recorderMiddlewareSet(clients)
+	if len(recorders) == 0 {
+		return errors.New("llm recorder: prune requested without recorder middleware")
+	}
+	groups := make(map[string][]*recorderMW)
+	for _, recorder := range recorders {
+		groups[recorder.recordingRoot()] = append(groups[recorder.recordingRoot()], recorder)
+	}
+	roots := make([]string, 0, len(groups))
+	for root := range groups {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	var result error
+	for _, root := range roots {
+		result = errors.Join(result, pruneRecorderGroup(root, groups[root]))
+	}
+	return result
+}
+
 func recorderMiddlewareSet(clients []Client) []*recorderMW {
 	seen := make(map[*recorderMW]struct{})
 	var recorders []*recorderMW
@@ -150,6 +181,71 @@ func verifyRecorderGroup(root string, recorders []*recorderMW) error {
 				"llm recorder: replay consumption mismatch for %s: consumed %d, recorded %d",
 				filepath.Base(path), boolCount(wasConsumed), boolCount(wasRecorded),
 			)
+		}
+	}
+	return nil
+}
+
+func pruneRecorderGroup(root string, recorders []*recorderMW) error {
+	mode := recorders[0].mode
+	runID := recorders[0].runID
+	for _, recorder := range recorders {
+		if recorder.configErr != nil {
+			return fmt.Errorf("llm recorder: invalid configuration: %w", recorder.configErr)
+		}
+		if recorder.mode != mode || recorder.runID != runID {
+			return fmt.Errorf("llm recorder: inconsistent recorder configuration for shared root %s", root)
+		}
+	}
+	if mode != RecordOnMiss {
+		return errors.New("llm recorder: prune unconsumed recordings requires record-on-miss mode")
+	}
+
+	consumed := make(map[string]struct{})
+	for _, recorder := range recorders {
+		recorder.writeMu.Lock()
+		recorder.seenMu.Lock()
+		for path := range recorder.seen {
+			consumed[path] = struct{}{}
+		}
+		recorder.seenMu.Unlock()
+		recorder.writeMu.Unlock()
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("llm recorder: list heal recordings in %s: %w", root, err)
+	}
+	stale := make([]string, 0)
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if entry.IsDir() {
+			if runID == RecorderDefaultRunID && entry.Name() == "runs" {
+				continue
+			}
+			return fmt.Errorf("llm recorder: unowned entry object %s", path)
+		}
+		kind, hash, err := recorderIdentityFromName(entry.Name())
+		if err != nil {
+			return fmt.Errorf("llm recorder: unowned entry object %s: %w", path, err)
+		}
+		rec, err := readRecording(path)
+		if err != nil {
+			return fmt.Errorf("llm recorder: inspect heal recording %s: %w", path, err)
+		}
+		if err := validateRecordingForRun(rec, hash, kind, runID); err != nil {
+			return fmt.Errorf("llm recorder: invalid content-addressed recording %s: %w", path, err)
+		}
+		if err := validateRecordingTransport(rec, recorders); err != nil {
+			return fmt.Errorf("llm recorder: invalid content-addressed recording %s: %w", path, err)
+		}
+		if _, keep := consumed[path]; !keep {
+			stale = append(stale, path)
+		}
+	}
+	for _, path := range stale {
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("llm recorder: remove obsolete heal recording %s: %w", path, err)
 		}
 	}
 	return nil
