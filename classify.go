@@ -91,8 +91,16 @@ func wrapWithMeta(provider string, code apierror.ErrorCode, status int, requestI
 }
 
 func refineAnthropicCode(code apierror.ErrorCode, err *anthropic.Error) apierror.ErrorCode {
-	t := strings.ToLower(string(err.Type()))
+	// Anthropic reports account credit exhaustion as invalid_request_error
+	// with HTTP 400, so neither status nor type distinguishes it from a
+	// malformed prompt. The stable billing phrase lives in the structured API
+	// body retained by the SDK. Recognize it here, at the provider boundary, so
+	// every retry gate and caller receives the same terminal classification.
+	t := strings.ToLower(string(err.Type()) + " " + err.RawJSON())
 	switch {
+	case strings.Contains(t, "credit balance is too low") ||
+		strings.Contains(t, "purchase credits"):
+		return apierror.CodeQuotaExhausted
 	case strings.Contains(t, "rate_limit"):
 		return apierror.CodeRateLimited
 	case strings.Contains(t, "overloaded"):
