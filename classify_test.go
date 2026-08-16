@@ -2,12 +2,14 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
+	anthropic "github.com/anthropics/anthropic-sdk-go"
 	openai "github.com/openai/openai-go"
 )
 
@@ -71,6 +73,37 @@ func TestClassifyOpenAI_UsesExactProviderName(t *testing.T) {
 	}
 	if pe.Code != CodeTimeout {
 		t.Fatalf("Code = %q, want %q", pe.Code, CodeTimeout)
+	}
+}
+
+func TestClassifyAnthropic_CreditBalanceExhaustionIsTerminal(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	apiErr := &anthropic.Error{
+		StatusCode: http.StatusBadRequest,
+		Request:    req,
+		Response: &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+		},
+	}
+	payload := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}`)
+	if err := json.Unmarshal(payload, apiErr); err != nil {
+		t.Fatalf("decode Anthropic error: %v", err)
+	}
+
+	classified := classifyAnthropic(apiErr, time.Unix(0, 0).UTC())
+	if !errors.Is(classified, ErrQuotaExhausted) {
+		t.Fatalf("classified error = %v, want quota exhausted", classified)
+	}
+	if IsRetryable(classified) {
+		t.Fatalf("credit exhaustion must fail without retry, got %v", classified)
+	}
+	var providerErr *ProviderError
+	if !errors.As(classified, &providerErr) || providerErr.Status != http.StatusBadRequest {
+		t.Fatalf("classified error = %+v, want original HTTP 400 evidence", classified)
 	}
 }
 
