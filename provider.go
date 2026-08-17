@@ -36,6 +36,7 @@ type clientBuilder struct {
 	costTracker    *CostTracker
 	rateLimit      float64
 	budgetUSD      float64
+	sharedBudget   *SharedSpendBudget
 	provider       Provider
 	providerInfo   ModelInfo
 	creds          APIKeyStore
@@ -128,6 +129,15 @@ func WithProvider(p Provider, info ModelInfo) ClientOption {
 func WithBudget(limitUSD float64) ClientOption {
 	return func(b *clientBuilder) {
 		b.budgetUSD = limitUSD
+	}
+}
+
+// WithSharedSpendBudget binds this client to one operator-owned budget shared
+// across all routed model clients. Recorder replay remains outside the budget,
+// so only live provider calls are charged.
+func WithSharedSpendBudget(budget *SharedSpendBudget) ClientOption {
+	return func(b *clientBuilder) {
+		b.sharedBudget = budget
 	}
 }
 
@@ -323,6 +333,13 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	// counted as LLM usage.
 	if b.budgetUSD > 0 {
 		mws = append(mws, BudgetMiddleware(tracker, b.budgetUSD))
+	}
+	// The shared account is immediately outside cost tracking so it always
+	// observes the usage produced by the call it admitted. A legacy per-client
+	// budget stays outside it and can reject without acquiring or charging the
+	// shared account.
+	if b.sharedBudget != nil {
+		mws = append(mws, SharedSpendBudgetMiddleware(b.sharedBudget))
 	}
 
 	// Cost tracking records one logical LLM call. Retry is inside it, so
