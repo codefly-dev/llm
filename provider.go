@@ -45,6 +45,44 @@ type clientBuilder struct {
 	timeouts       *TimeoutConfig
 }
 
+// configuredProviderClient preserves the identity selected at construction
+// even when the live provider is deliberately absent (for example cassette
+// replay-only mode). Unwrap keeps richer tool, stream, usage, and transport
+// capabilities discoverable through the standard invocation helpers.
+type configuredProviderClient struct {
+	Client
+	provider string
+	model    string
+}
+
+func (c *configuredProviderClient) Provider() string { return c.provider }
+func (c *configuredProviderClient) Model() string    { return c.model }
+func (c *configuredProviderClient) Unwrap() Client   { return c.Client }
+
+func (c *configuredProviderClient) CallWithOptions(ctx context.Context, prompt string, opts RequestOptions) (string, error) {
+	return CallWithOptions(ctx, c.Client, prompt, opts)
+}
+
+func (c *configuredProviderClient) StreamWithOptions(ctx context.Context, prompt string, opts RequestOptions, onChunk func(string) error) (string, error) {
+	return StreamWithOptions(ctx, c.Client, prompt, opts, onChunk)
+}
+
+func (c *configuredProviderClient) CallCached(ctx context.Context, system, user string) (string, error) {
+	return CallWithCaching(ctx, c.Client, system, user)
+}
+
+func (c *configuredProviderClient) CallCachedWithOptions(ctx context.Context, system, user string, opts RequestOptions) (string, error) {
+	return CallCachedWithOptions(ctx, c.Client, system, user, opts)
+}
+
+func (c *configuredProviderClient) CallWithTools(ctx context.Context, system string, messages []Message, tools []ToolDef) (Message, error) {
+	return c.CallWithToolsOptions(ctx, system, messages, tools, RequestOptions{})
+}
+
+func (c *configuredProviderClient) CallWithToolsOptions(ctx context.Context, system string, messages []Message, tools []ToolDef, opts RequestOptions) (Message, error) {
+	return CallWithToolsOptions(ctx, c.Client, system, messages, tools, opts)
+}
+
 // WithRetry adds retry middleware with exponential backoff.
 func WithRetry(maxRetries int, baseBackoff time.Duration) ClientOption {
 	return func(b *clientBuilder) {
@@ -372,7 +410,9 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 	}
 	mws = append(mws, RateLimitMiddlewareRPS(rps))
 
-	return Chain(inner, mws...), nil
+	return &configuredProviderClient{
+		Client: Chain(inner, mws...), provider: providerName, model: modelName,
+	}, nil
 }
 
 // protectProviderErrors installs the same credential-redaction boundary for
