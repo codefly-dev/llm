@@ -564,6 +564,24 @@ func TestRecorderReplayDoesNotCrossModelFamilies(t *testing.T) {
 	}
 }
 
+func TestNewClientReplayOnlyPreservesConfiguredProviderIdentity(t *testing.T) {
+	client, err := NewClient(
+		ModelOpenAIGPT56Terra,
+		Options{},
+		WithRecorder(t.TempDir(), RecordReplayOnly),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := AsProviderMeta(client)
+	if !ok {
+		t.Fatal("replay-only client lost configured provider identity")
+	}
+	if meta.Provider() != "openai" || meta.Model() != "gpt-5.6-terra" {
+		t.Fatalf("replay-only identity = %s/%s", meta.Provider(), meta.Model())
+	}
+}
+
 func TestRecorderUsesInjectedClockForStableMetadata(t *testing.T) {
 	dir := t.TempDir()
 	prompt := "deterministic timestamp"
