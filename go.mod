@@ -1,8 +1,6 @@
 module github.com/codefly-dev/llm
 
-go 1.25.8
-
-toolchain go1.26.3
+go 1.27.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.59.0
