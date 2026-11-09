@@ -168,7 +168,7 @@ func TestLookupModel_AllKnownProviders(t *testing.T) {
 	}
 }
 
-func TestExecutableAnthropicRosterIsExactlyHaiku45Sonnet5Opus48(t *testing.T) {
+func TestExecutableAnthropicRosterIsExactlyTheSupportedModels(t *testing.T) {
 	var got []string
 	for _, info := range modelRegistry {
 		if info.Provider == "anthropic" {
@@ -176,7 +176,11 @@ func TestExecutableAnthropicRosterIsExactlyHaiku45Sonnet5Opus48(t *testing.T) {
 		}
 	}
 	sort.Strings(got)
-	want := []string{AnthropicModelHaiku, AnthropicModelOpus, AnthropicModelSonnet}
+	// The tier defaults plus the 5.5 generation, which callers name
+	// explicitly. Adding a model here means checking this client sends it
+	// nothing it rejects (thinking, tool_choice, sampling).
+	want := []string{AnthropicModelHaiku, AnthropicModelOpus, AnthropicModelSonnet,
+		"claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"}
 	sort.Strings(want)
 	if len(got) != len(want) {
 		t.Fatalf("Anthropic executable roster = %v, want exactly %v", got, want)
@@ -184,6 +188,30 @@ func TestExecutableAnthropicRosterIsExactlyHaiku45Sonnet5Opus48(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("Anthropic executable roster = %v, want exactly %v", got, want)
+		}
+	}
+}
+
+func TestLookupModel_Claude55Generation(t *testing.T) {
+	cases := []struct {
+		model     string
+		in, out   float64
+		maxOutput int
+	}{
+		{"claude-opus-5-5", 4.00, 20.00, 128_000},
+		{"claude-sonnet-5-5", 2.00, 10.00, 128_000},
+		{"claude-haiku-5-5", 0.10, 0.50, 128_000},
+	}
+	for _, c := range cases {
+		info, err := RequireModel("anthropic", c.model)
+		if err != nil {
+			t.Fatalf("%s: %v", c.model, err)
+		}
+		if info.InputPricePer1M != c.in || info.OutputPricePer1M != c.out || info.MaxOutput != c.maxOutput || info.ContextWindow != 1_000_000 {
+			t.Errorf("%s = %+v", c.model, info)
+		}
+		if anthropicSupportsBudgetedThinking(c.model) {
+			t.Errorf("%s must not receive budgeted thinking (400 on the 5.5 generation)", c.model)
 		}
 	}
 }

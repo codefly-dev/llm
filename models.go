@@ -43,6 +43,26 @@ var modelRegistry = map[string]ModelInfo{
 		ContextWindow: 1_000_000, MaxOutput: 128_000,
 		InputPricePer1M: 3.00, OutputPricePer1M: 15.00,
 	},
+	// ── Anthropic 5.5 generation (Oct 2026) ──────────────────
+	// Callable as-is: this client sends no budgeted thinking to them (they
+	// run adaptive thinking by default), never forces tool_choice (a 400 on
+	// Opus 5.5 and Sonnet 5.5), and sends temperature/top_p only when a
+	// caller sets them (Opus 5.5 rejects both).
+	"anthropic/claude-opus-5-5": {
+		Provider: "anthropic", Model: "claude-opus-5-5",
+		ContextWindow: 1_000_000, MaxOutput: 128_000,
+		InputPricePer1M: 4.00, OutputPricePer1M: 20.00,
+	},
+	"anthropic/claude-sonnet-5-5": {
+		Provider: "anthropic", Model: "claude-sonnet-5-5",
+		ContextWindow: 1_000_000, MaxOutput: 128_000,
+		InputPricePer1M: 2.00, OutputPricePer1M: 10.00,
+	},
+	"anthropic/claude-haiku-5-5": {
+		Provider: "anthropic", Model: "claude-haiku-5-5",
+		ContextWindow: 1_000_000, MaxOutput: 128_000,
+		InputPricePer1M: 0.10, OutputPricePer1M: 0.50,
+	},
 	"anthropic/claude-haiku-4-5-20251001": {
 		Provider: "anthropic", Model: "claude-haiku-4-5-20251001",
 		ContextWindow: 200_000, MaxOutput: 64_000,
