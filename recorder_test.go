@@ -780,6 +780,45 @@ func TestRecorderReplayRejectsDuplicateConsumption(t *testing.T) {
 	}
 }
 
+// A long-running process that replays asks the same thing again on purpose:
+// with a repeatable recorder the first request records and every later one
+// is answered with that recording, on the same client.
+func TestRepeatableRecorderAnswersTheSameRequestAgain(t *testing.T) {
+	dir := t.TempDir()
+	inner := &recorderInfraClient{response: Message{Content: "one answer"}}
+	client := RecorderMiddlewareWithConfig(RecorderConfig{Dir: dir, Model: "test-model", Mode: RecordOnMiss, Repeatable: true})(inner)
+	for i := range 3 {
+		got, err := client.Call(t.Context(), "identical")
+		if err != nil || got != "one answer" {
+			t.Fatalf("call %d: %q %v", i+1, got, err)
+		}
+	}
+	if inner.calls != 1 {
+		t.Fatalf("provider calls = %d, want 1: the first records, the others replay", inner.calls)
+	}
+	// Another request is its own recording.
+	if _, err := client.Call(t.Context(), "another"); err != nil || inner.calls != 2 {
+		t.Fatalf("a different request reaches the provider once: calls %d, %v", inner.calls, err)
+	}
+	// Replay only, repeatable: the same recording as often as asked, and
+	// never the provider.
+	live := &recorderInfraClient{}
+	replay := RecorderMiddlewareWithConfig(RecorderConfig{Dir: dir, Model: "test-model", Mode: RecordReplayOnly, Repeatable: true})(live)
+	for range 2 {
+		if got, err := replay.Call(t.Context(), "identical"); err != nil || got != "one answer" {
+			t.Fatalf("replay: %q %v", got, err)
+		}
+	}
+	if live.calls != 0 {
+		t.Fatalf("replay called the provider %d times", live.calls)
+	}
+	// Recording always and answering always the same cannot both hold.
+	always := RecorderMiddlewareWithConfig(RecorderConfig{Dir: dir, Model: "test-model", Mode: RecordAlways, Repeatable: true})(inner)
+	if _, err := always.Call(t.Context(), "identical"); err == nil || !strings.Contains(err.Error(), "repeatable") {
+		t.Fatalf("RecordAlways with Repeatable is a configuration error: %v", err)
+	}
+}
+
 func TestRecorderReplayValidatesStoredIdentity(t *testing.T) {
 	mutations := map[string]func(*recording){
 		"model":       func(rec *recording) { rec.Model = "other-model" },

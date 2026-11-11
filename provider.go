@@ -29,9 +29,11 @@ type clientBuilder struct {
 	recorderDir      string
 	recorderDebugDir string
 	recorderRunID    string
-	recorderClock    clock.Clock
-	runtimeClock     clock.Clock
-	recordMode       RecordMode
+	// recorderRepeatable: see WithRecorderRepeatable.
+	recorderRepeatable bool
+	recorderClock      clock.Clock
+	runtimeClock       clock.Clock
+	recordMode         RecordMode
 
 	costTracker    *CostTracker
 	rateLimit      float64
@@ -117,6 +119,27 @@ func WithRecorderDebugDir(dir string) ClientOption {
 func WithRecorderRunID(runID string) ClientOption {
 	return func(b *clientBuilder) {
 		b.recorderRunID = runID
+	}
+}
+
+// WithRecorderRepeatable lets one client make the same request any number
+// of times, each answered with the same recording.
+//
+// By default a recorder serves a recording once per client: it is made for
+// one run of a test, where the same request made twice means two samples,
+// which a content-addressed cassette cannot hold, so the second is refused
+// ("duplicate request"). A long-running process that replays (a service
+// played the same scenario again, a development server answering from
+// recordings) asks the same thing again on purpose and wants the same
+// answer. With this option it gets it: the first request records (in
+// RecordOnMiss), every later one replays.
+//
+// It applies to RecordOnMiss and RecordReplayOnly; with RecordAlways the
+// client is misconfigured. Two identical requests that both miss at the
+// same moment may each reach the provider; the last answer is kept.
+func WithRecorderRepeatable() ClientOption {
+	return func(b *clientBuilder) {
+		b.recorderRepeatable = true
 	}
 }
 
@@ -345,6 +368,7 @@ func NewClient(model Model, opts Options, clientOpts ...ClientOption) (Client, e
 			Mode:              b.recordMode,
 			RunID:             b.recorderRunID,
 			Clock:             b.recorderClock,
+			Repeatable:        b.recorderRepeatable,
 		}))
 	}
 

@@ -86,6 +86,10 @@ type RecorderConfig struct {
 	Mode              RecordMode
 	RunID             string
 	Clock             clock.Clock
+	// Repeatable lets one client make the same request any number of
+	// times, each answered with the same recording. See
+	// WithRecorderRepeatable.
+	Repeatable bool
 }
 
 func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
@@ -106,6 +110,12 @@ func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
 	if cfg.Mode != RecordReplayOnly && cfg.Mode != RecordAlways && cfg.Mode != RecordOnMiss {
 		configErr = errors.Join(configErr, fmt.Errorf("invalid recorder mode %d", cfg.Mode))
 	}
+	if cfg.Repeatable && cfg.Mode == RecordAlways {
+		// Recording every time and answering every time with the same
+		// recording cannot both hold: the second call would replace the
+		// first one's sample.
+		configErr = errors.Join(configErr, fmt.Errorf("a repeatable recorder replays (RecordOnMiss or RecordReplayOnly), it does not record always"))
+	}
 	return func(next Client) Client {
 		return &recorderMW{
 			next:              next,
@@ -117,6 +127,7 @@ func RecorderMiddlewareWithConfig(cfg RecorderConfig) Middleware {
 			runID:             runID,
 			clock:             recorderClock,
 			configErr:         configErr,
+			repeatable:        cfg.Repeatable,
 		}
 	}
 }
@@ -152,6 +163,10 @@ type recorderMW struct {
 	writeMu sync.Mutex
 	seenMu  sync.Mutex
 	seen    map[string]struct{}
+	// repeatable: a request made again is the same request, answered with
+	// the same recording, rather than a second sample that a
+	// content-addressed cassette cannot hold.
+	repeatable bool
 }
 
 func (m *recorderMW) Call(ctx context.Context, prompt string) (string, error) {
@@ -731,6 +746,9 @@ func validateRecordingForRun(rec recording, hash string, kind recordingKind, run
 }
 
 func (m *recorderMW) claim(path string) error {
+	if m.repeatable {
+		return nil
+	}
 	m.seenMu.Lock()
 	defer m.seenMu.Unlock()
 	if m.seen == nil {
